@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -281,6 +282,14 @@ class RemoteRunTests(unittest.TestCase):
                 job, str(workdir), shared_dir=str(shared_dir), extra_paths=["cache/ok.txt"]
             )
             self.assertEqual(wfiles, ["cache/ok.txt"])
+            po_j, po_w, po_s = rr.eligible_pull_files(
+                job, str(workdir), shared_dir=str(shared_dir), extra_paths=["cache/ok.txt"], paths_only=True
+            )
+            self.assertEqual(po_j, [])
+            self.assertEqual(po_w, ["cache/ok.txt"])
+            self.assertEqual(po_s, [])
+            with self.assertRaisesRegex(ValueError, "--paths-only"):
+                rr.eligible_pull_files(job, str(workdir), paths_only=True)
             with self.assertRaisesRegex(ValueError, "cannot be a file symlink|escapes workspace"):
                 rr.eligible_pull_files(job, str(workdir), shared_dir=str(shared_dir), extra_paths=["escape"])
             with self.assertRaisesRegex(ValueError, "finite"):
@@ -526,11 +535,15 @@ class RemoteRunTests(unittest.TestCase):
                     ]):
                         out, _, _ = rr.cli()
                     self.assertEqual(out["status"], "completed")
+                    self.assertEqual(out["request"]["project_id"], "")
+                    self.assertEqual(out["request"]["workspace_id"], "")
+                    self.assertEqual(out["request"]["shared_dir"], "")
                     with mock.patch.object(sys, "argv", [
                         "remote-run", "--config", str(cfg), "exec", "--no-sync", "--remote-dir", str(unmanaged), "--wait", "0", "--", "ls",
                     ]):
                         out, _, _ = rr.cli()
                     self.assertEqual(out["status"], "completed")
+                    self.assertEqual(out["request"]["project_id"], "")
                 # exec WITH sync from $HOME must still fail
                 with mock.patch.object(sys, "argv", [
                     "remote-run", "--config", str(cfg), "exec", "--", "echo", "hi",
@@ -653,11 +666,16 @@ class RemoteRunTests(unittest.TestCase):
             )
             lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
             self.assertEqual(len(lines), 11)
-            self.assertEqual(lines[0]["result"]["protocolVersion"], "2025-03-26")
-            self.assertEqual(lines[1]["error"]["code"], -32700)
-            self.assertEqual(lines[2]["error"]["code"], -32600)
-            tools = {t["name"]: t for t in lines[3]["result"]["tools"]}
+            by_id = {item.get("id"): item for item in lines if item.get("id") is not None}
+            errs = [item for item in lines if item.get("id") is None]
+            self.assertEqual(len(errs), 2)
+            self.assertEqual(errs[0]["error"]["code"], -32700)
+            self.assertEqual(errs[1]["error"]["code"], -32600)
+            self.assertEqual(by_id[1]["result"]["protocolVersion"], "2025-03-26")
+            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "0.4.0")
+            tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
             self.assertIn("remote_prune", tools)
+            self.assertIn("paths_only", tools["remote_pull"]["inputSchema"]["properties"])
             self.assertIn("annotations", tools["remote_exec"])
             self.assertTrue(tools["remote_exec"]["annotations"]["destructiveHint"])
             self.assertTrue(tools["remote_pull"]["annotations"]["destructiveHint"])
@@ -665,12 +683,117 @@ class RemoteRunTests(unittest.TestCase):
             self.assertIn("dry_run", sync_props)
             self.assertNotIn("delete", sync_props)
             self.assertNotIn("adopt", sync_props)
-            self.assertTrue(lines[6]["result"]["isError"])  # missing repo on remote_exec
-            self.assertTrue(lines[7]["result"]["isError"])  # missing run_id on remote_cancel
-            self.assertTrue(lines[8]["result"]["isError"])  # --force flag injection blocked
-            # lines[9] was limit=None -> fails only on SSH 's' (not TypeError!)
-            self.assertNotIn("TypeError", lines[9]["result"]["content"][0]["text"])
-            self.assertTrue(lines[10]["result"]["isError"])  # non-finite wait OverflowError -> isError
+            self.assertFalse(by_id[3]["result"]["isError"])  # remote_hosts
+            self.assertFalse(by_id[4]["result"]["isError"])  # remote_config
+            self.assertTrue(by_id[5]["result"]["isError"])   # missing repo on remote_exec
+            self.assertTrue(by_id[6]["result"]["isError"])   # missing run_id on remote_cancel
+            self.assertTrue(by_id[7]["result"]["isError"])   # --force flag injection blocked
+            # id=8 was limit=None -> fails only on SSH 's' (not TypeError!)
+            self.assertNotIn("TypeError", by_id[8]["result"]["content"][0]["text"])
+            self.assertTrue(by_id[9]["result"]["isError"])   # non-finite wait OverflowError -> isError
+
+    def test_mcp_parallel_tool_calls_no_hol_blocking(self):
+        import io
+        import remote_run_mcp as mcp
+
+        barrier = threading.Barrier(2, timeout=2.0)
+        def concurrent_call(_name, _args):
+            barrier.wait()
+            return {"content": [{"type": "text", "text": "ok"}], "isError": False}
+
+        reqs = "\n".join([
+            json.dumps({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "remote_hosts", "arguments": {}}}),
+            json.dumps({"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {"name": "remote_hosts", "arguments": {}}}),
+        ]) + "\n"
+        out_buf = io.StringIO()
+        with mock.patch.object(mcp, "call_tool", side_effect=concurrent_call), \
+             mock.patch.object(sys, "stdin", io.StringIO(reqs)), \
+             mock.patch.object(sys, "stdout", out_buf):
+            mcp.main()
+        resps = {json.loads(line)["id"]: json.loads(line) for line in out_buf.getvalue().strip().splitlines()}
+        self.assertEqual(set(resps), {10, 11})
+        self.assertFalse(resps[10]["result"]["isError"])
+        self.assertFalse(resps[11]["result"]["isError"])
+
+    def test_doctor_status_wait_gpu_isolation_git_env_and_permissions(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            r = base / "root"
+            rr.ensure_root_owned(r, init_root=True)
+            host = {"name": "h", "root": str(r), "locks_dir": str(r / "locks"), "device": "cuda:0"}
+
+            # 1 & 2. doctor refuses empty python for probes, and batched doctor reports missing_imports cleanly
+            with mock.patch.object(rr.shutil, "which", return_value="/usr/bin/true"):
+                with self.assertRaisesRegex(ValueError, "no host Python"):
+                    rr.control({"action": "doctor", "host": {**host, "device": "cpu"}, "env_name": "venv", "python": "", "check_cuda": True})
+                with mock.patch.object(rr, "run", side_effect=[
+                    "0, Mock GPU, 12288 MiB",
+                    "Python 3.12.0",
+                    json.dumps({"imports": {"json": True, "nonexistent_mod_xyz": False}, "cuda_probe": {"cuda": False, "count": 0}}),
+                ]):
+                    dres = rr.control({
+                        "action": "doctor", "host": host, "env_name": "py", "python": sys.executable,
+                        "check_imports": ["json", "nonexistent_mod_xyz"], "check_cuda": True,
+                    })
+            self.assertEqual(dres["status"], "missing_imports")
+            self.assertTrue(dres["_exec_failed"])
+            self.assertEqual(dres["missing_imports"], ["nonexistent_mod_xyz"])
+            self.assertTrue(dres["imports"]["json"])
+
+            # 3. server-side status wait runs WITHOUT acquiring submit.lock
+            job = r / "runs" / "rr-wait-test"
+            job.mkdir(parents=True)
+            rr.write_json(job / "request.json", {"host": "h", "device": "cpu", "workdir": str(r)})
+            rr.write_json(job / "state.json", {"run_id": "rr-wait-test", "status": "completed"})
+            (job / "run.log").write_text("done\n")
+            with (r / "submit.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                st_res = rr.control({"action": "status", "host": host, "run_id": "rr-wait-test", "wait_sec": 0.1})
+            self.assertEqual(st_res["status"], "completed")
+
+            # 4. --no-gpu hides CUDA, git provenance env vars injected, user mkdir keeps natural umask, sessions stay 0700
+            repo = base / "repo"
+            repo.mkdir()
+            head_sha = git_init_commit(repo, "main")
+            (repo / "dirty.txt").write_text("x\n")
+            ws_info = rr.resolve_workspace(repo, rr.empty_project_config(), {"root": str(r)}, in_git=True)
+            self.assertEqual(ws_info["git_commit"], head_sha)
+            self.assertEqual(ws_info["git_branch"], "main")
+            self.assertTrue(ws_info["git_dirty"])
+
+            wjob = r / "runs" / "rr-worker-check"
+            (wjob / "artifacts").mkdir(parents=True)
+            wdir = r / "ws_check"
+            wdir.mkdir()
+            skey = rr.session_key_for(str(wdir), "dev")
+            req = {
+                "host": "h", "device": "cuda:0", "physical_device": "cuda:0", "gpu_slot": "gpu-0",
+                "locks_dir": str(r / "locks"), "use_gpu": False, "env_name": "none",
+                "python": "", "auto_venv": False, "path_prepend": [], "env_static": {},
+                "env_vars": {"G": "{git_commit}:{git_branch}"}, "shared": {}, "workdir": str(wdir),
+                "shared_dir": "", "rel_subdir": "", "project_id": "p", "workspace_id": "main",
+                "git_commit": head_sha, "git_branch": "main", "git_dirty": True,
+                "session": "dev", "session_key": skey,
+                "shell": "mkdir -p out_dir && python3 -c \"import os; print(os.environ['REMOTE_RUN_DEVICE'], repr(os.environ['CUDA_VISIBLE_DEVICES']), os.environ['REMOTE_RUN_GIT_COMMIT'], os.environ['REMOTE_RUN_GIT_BRANCH'], os.environ['REMOTE_RUN_GIT_DIRTY'], os.environ['G'])\"",
+                "command": [],
+            }
+            rr.write_json(wjob / "request.json", req)
+            rr.write_json(wjob / "state.json", {"run_id": "rr-worker-check", "status": "queued", "submitted_at": rr.now()})
+            old_umask = os.umask(0o022)
+            try:
+                wproc = subprocess.run(
+                    [sys.executable, "-B", str(ROOT / "remote_run.py"), "_worker", str(r), str(wjob)],
+                    capture_output=True, text=True, check=True,
+                )
+            finally:
+                os.umask(old_umask)
+            self.assertEqual(rr.read_json(wjob / "state.json")["status"], "completed")
+            self.assertIn(f"cpu '' {head_sha} main 1 {head_sha}:main", wproc.stdout)
+            self.assertNotEqual((wdir / "out_dir").stat().st_mode & 0o777, 0o700)
+            self.assertEqual((r / "sessions").stat().st_mode & 0o777, 0o700)
+            self.assertEqual((r / "sessions" / f"{skey}.json").stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

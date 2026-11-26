@@ -66,8 +66,9 @@ remote-run status RUN_ID --offset 8192 --raw-log
 # Cancel a queued or running job cleanly (kills PGID + frees VRAM, keeps logs)
 remote-run cancel RUN_ID
 
-# Pull logs, metadata, and eligible artifacts (or merge into existing dir with --force)
+# Pull logs, metadata, and eligible artifacts (or merge only extra workspace paths with --paths-only --force)
 remote-run pull RUN_ID ./results/RUN_ID --path outputs/notes.txt
+remote-run pull RUN_ID ./results/RUN_ID --path outputs/preds.npz --paths-only --force
 
 # Inspect or clean old terminal runs (>14 days) on the host (skips unmanaged dirs)
 remote-run prune --days 14

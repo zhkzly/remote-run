@@ -26,7 +26,7 @@ SSH = [
     "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=7",
     "-o", "ConnectionAttempts=1", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes",
     "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
-    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+    "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
 ]
 TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
 CHECKPOINT_SUFFIXES = {".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx", ".h5"}
@@ -297,10 +297,18 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
     repo_root = repo_root.resolve()
     root_commit = ""
     branch = ""
+    git_commit = ""
+    git_dirty = False
     if in_git:
         ok_rc, rc_out = try_run(["git", "rev-list", "--max-parents=0", "HEAD"], cwd=repo_root)
         if ok_rc and rc_out:
             root_commit = sorted(rc_out.splitlines())[0][:8]
+        ok_hd_full, hd_full = try_run(["git", "rev-parse", "HEAD"], cwd=repo_root)
+        if ok_hd_full and hd_full:
+            git_commit = hd_full.strip()
+        ok_st, st_out = try_run(["git", "status", "--porcelain"], cwd=repo_root)
+        if ok_st:
+            git_dirty = bool(st_out.strip())
         ok_br, br_out = try_run(["git", "symbolic-ref", "--short", "HEAD"], cwd=repo_root)
         if ok_br and br_out:
             branch = br_out
@@ -353,6 +361,7 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
         "project_id": project_id, "workspace_id": workspace_id, "managed": managed,
         "workdir": wdir, "shared_dir": shared_dir, "rel_subdir": rel_subdir,
         "in_git": in_git, "branch": branch, "root_commit": root_commit,
+        "git_commit": git_commit, "git_branch": branch, "git_dirty": git_dirty,
     }
 
 
@@ -816,29 +825,33 @@ def remote_cancel(root, job):
     return state_of(job, root)
 
 
-def eligible_pull_files(job, workdir, *, shared_dir="", all_artifacts=False, max_file_mb=10.0, extra_paths=()):
+def eligible_pull_files(job, workdir, *, shared_dir="", all_artifacts=False, max_file_mb=10.0, extra_paths=(), paths_only=False):
     if not math.isfinite(max_file_mb) or max_file_mb < 0:
         raise ValueError("--max-file-mb must be a finite non-negative number")
-    job_files = [n for n in ("request.json", "state.json", "run.log") if (job / n).is_file()]
-    art_root = job / "artifacts"
+    if paths_only and not extra_paths:
+        raise ValueError("--paths-only requires at least one --path")
+    job_files = []
     skipped = []
-    limit_bytes = max(0, int(max_file_mb * 1024 * 1024))
-    if art_root.is_dir():
-        art_resolved = art_root.resolve()
-        for item in sorted(art_root.rglob("*")):
-            if item.is_symlink() or not item.is_file():
-                continue
-            if not item.resolve().is_relative_to(art_resolved):
-                continue
-            rel = item.relative_to(job).as_posix()
-            size = item.stat().st_size
-            if not all_artifacts and item.suffix.lower() in CHECKPOINT_SUFFIXES:
-                skipped.append({"path": rel, "size_bytes": size, "reason": "checkpoint"})
-                continue
-            if not all_artifacts and limit_bytes and size > limit_bytes:
-                skipped.append({"path": rel, "size_bytes": size, "reason": f"exceeds_{max_file_mb}mb"})
-                continue
-            job_files.append(rel)
+    if not paths_only:
+        job_files = [n for n in ("request.json", "state.json", "run.log") if (job / n).is_file()]
+        art_root = job / "artifacts"
+        limit_bytes = max(0, int(max_file_mb * 1024 * 1024))
+        if art_root.is_dir():
+            art_resolved = art_root.resolve()
+            for item in sorted(art_root.rglob("*")):
+                if item.is_symlink() or not item.is_file():
+                    continue
+                if not item.resolve().is_relative_to(art_resolved):
+                    continue
+                rel = item.relative_to(job).as_posix()
+                size = item.stat().st_size
+                if not all_artifacts and item.suffix.lower() in CHECKPOINT_SUFFIXES:
+                    skipped.append({"path": rel, "size_bytes": size, "reason": "checkpoint"})
+                    continue
+                if not all_artifacts and limit_bytes and size > limit_bytes:
+                    skipped.append({"path": rel, "size_bytes": size, "reason": f"exceeds_{max_file_mb}mb"})
+                    continue
+                job_files.append(rel)
     workdir_files = []
     wroot = Path(workdir).resolve()
     sroot = Path(shared_dir).resolve() if shared_dir else None
@@ -978,6 +991,7 @@ def control(payload):
             raise ValueError(f"Compute host missing required tool(s): {', '.join(missing)}")
         ensure_root_owned(root, init_root=bool(payload.get("init_root", False)))
         locks_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(locks_dir, 0o700)
         info = {
             "status": "ready",
             "host": host["name"],
@@ -990,22 +1004,51 @@ def control(payload):
                 raise ValueError("Host configured for CUDA but 'nvidia-smi' not found")
             gpus = run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"])
             info["gpus"] = parse_gpus(gpus)
+        check_imports = list(payload.get("check_imports", []))
+        check_cuda = bool(payload.get("check_cuda", False))
         py = payload.get("python", "")
+        if (check_imports or check_cuda) and not py:
+            raise ValueError(
+                f"Cannot run --check-import/--check-cuda with env {info['env']!r} (no host Python configured); "
+                "pass --env <name> with a configured python path"
+            )
         if py:
             if not Path(py).is_file():
                 raise ValueError(f"Configured python not found on host: {py}")
             info["python"] = py
             info["python_version"] = run([py, "--version"])
-            for mod in payload.get("check_imports", []):
-                identifier(mod.split(".")[0], "module")
-                run([py, "-B", "-c", f"import importlib; importlib.import_module({mod!r})"])
-            info["checked_imports"] = payload.get("check_imports", [])
-            if payload.get("check_cuda"):
-                info["cuda_probe"] = json.loads(run([
-                    py, "-B", "-c",
-                    "import json,torch; print(json.dumps({'cuda': torch.cuda.is_available(), "
-                    "'count': torch.cuda.device_count()}))"
-                ]))
+            if check_imports or check_cuda:
+                for mod in check_imports:
+                    identifier(mod.split(".")[0], "module")
+                probe_code = (
+                    "import importlib, json, sys\n"
+                    "mods = json.loads(sys.argv[1])\n"
+                    "check_cuda = sys.argv[2] == '1'\n"
+                    "imports = {}\n"
+                    "for m in mods:\n"
+                    "    try:\n"
+                    "        importlib.import_module(m)\n"
+                    "        imports[m] = True\n"
+                    "    except Exception:\n"
+                    "        imports[m] = False\n"
+                    "res = {'imports': imports}\n"
+                    "if check_cuda:\n"
+                    "    try:\n"
+                    "        import torch\n"
+                    "        res['cuda_probe'] = {'cuda': bool(torch.cuda.is_available()), 'count': int(torch.cuda.device_count())}\n"
+                    "    except Exception as exc:\n"
+                    "        res['cuda_probe'] = {'cuda': False, 'count': 0, 'error': str(exc)}\n"
+                    "print(json.dumps(res))\n"
+                )
+                probe = json.loads(run([py, "-B", "-c", probe_code, json.dumps(check_imports), "1" if check_cuda else "0"]))
+                info["checked_imports"] = check_imports
+                info["imports"] = probe["imports"]
+                info["missing_imports"] = [m for m in check_imports if not probe["imports"].get(m)]
+                if check_cuda:
+                    info["cuda_probe"] = probe["cuda_probe"]
+                if info["missing_imports"]:
+                    info["status"] = "missing_imports"
+                    info["_exec_failed"] = True
         verified_shared = {}
         for alias, binding in payload.get("shared", {}).items():
             verified_shared[alias] = verify_shared_asset(binding)
@@ -1027,6 +1070,7 @@ def control(payload):
 
     ensure_root_owned(root)
     locks_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(locks_dir, 0o700)
 
     if action == "session":
         sdir = root / "sessions"
@@ -1049,6 +1093,7 @@ def control(payload):
         if sub == "reset":
             key = session_key_for(payload["workdir"], payload["name"])
             sdir.mkdir(parents=True, exist_ok=True)
+            os.chmod(sdir, 0o700)
             with (sdir / f"{key}.lock").open("a") as slock:
                 fcntl.flock(slock, fcntl.LOCK_EX)
                 target = sdir / f"{key}.json"
@@ -1056,6 +1101,25 @@ def control(payload):
                 target.unlink(missing_ok=True)
             return {"reset": True, "name": payload["name"], "existed": existed, "workdir": payload["workdir"]}
         raise ValueError(f"Unknown session subaction: {sub}")
+
+    if action == "status":
+        wait_sec = float(payload.get("wait_sec", 0.0))
+        if not math.isfinite(wait_sec) or wait_sec < 0:
+            raise ValueError("wait_sec must be a finite non-negative number")
+        job = root / "runs" / identifier(payload["run_id"], "run_id")
+        deadline = time.monotonic() + wait_sec
+        state = state_of(job, root)
+        while state["status"] not in TERMINAL and time.monotonic() < deadline:
+            time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+            state = state_of(job, root)
+        if payload.get("include_log", True):
+            state["log"] = read_log_slice(
+                job / "run.log",
+                offset=payload.get("offset"),
+                tail_bytes=payload.get("tail_bytes", 8192),
+                raw_log=payload.get("raw_log", False),
+            )
+        return state
 
     with (root / "submit.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1098,15 +1162,6 @@ def control(payload):
         if action == "cancel":
             return remote_cancel(root, job)
         state = state_of(job, root)
-        if action == "status":
-            if payload.get("include_log", True):
-                state["log"] = read_log_slice(
-                    job / "run.log",
-                    offset=payload.get("offset"),
-                    tail_bytes=payload.get("tail_bytes", 8192),
-                    raw_log=payload.get("raw_log", False),
-                )
-            return state
         if action == "pull":
             if state["status"] not in TERMINAL:
                 raise ValueError(f"Run {job.name} is still {state['status']}; wait or cancel before pulling")
@@ -1115,6 +1170,7 @@ def control(payload):
                 all_artifacts=payload.get("all_artifacts", False),
                 max_file_mb=payload.get("max_file_mb", 10.0),
                 extra_paths=payload.get("paths", ()),
+                paths_only=bool(payload.get("paths_only", False)),
             )
             return {
                 "status": state["status"], "job_files": job_files, "workdir_files": workdir_files,
@@ -1132,6 +1188,7 @@ def load_session(root, session_key, fallback_cwd):
         return fallback_cwd, {}
     sdir = root / "sessions"
     sdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(sdir, 0o700)
     with (sdir / f"{session_key}.lock").open("a") as slock:
         fcntl.flock(slock, fcntl.LOCK_SH)
         path = session_file(root, session_key)
@@ -1165,6 +1222,7 @@ def update_session(root, session_key, session_name_user, workdir, cwd_out, env_o
     removed = {k for k in prev_session_env if k not in after_env} if after_env else set()
     sdir = root / "sessions"
     sdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(sdir, 0o700)
     with (sdir / f"{session_key}.lock").open("a") as slock:
         fcntl.flock(slock, fcntl.LOCK_EX)
         path = session_file(root, session_key)
@@ -1180,6 +1238,7 @@ def update_session(root, session_key, session_name_user, workdir, cwd_out, env_o
             "env": merged,
             "updated_at": now(),
         })
+        os.chmod(path, 0o600)
     return new_cwd
 
 
@@ -1249,8 +1308,10 @@ def worker(root, job):
 
             user_cvd = "CUDA_VISIBLE_DEVICES" in request.get("env_static", {}) or "CUDA_VISIBLE_DEVICES" in request.get("env_vars", {})
             exposed_device = request["device"]
-            if request["device"] == "cpu":
-                env["CUDA_VISIBLE_DEVICES"] = ""
+            if request["device"] == "cpu" or not request.get("use_gpu", True):
+                if not user_cvd:
+                    env["CUDA_VISIBLE_DEVICES"] = ""
+                exposed_device = "cpu"
             elif request["device"].startswith("cuda") and not user_cvd:
                 idx = request["device"].partition(":")[2] or "0"
                 env["CUDA_VISIBLE_DEVICES"] = idx
@@ -1260,6 +1321,10 @@ def worker(root, job):
             env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             env.update(session_env)
 
+            git_commit = request.get("git_commit", "")
+            git_branch = request.get("git_branch", "")
+            git_dirty = "1" if request.get("git_dirty") else ("0" if git_commit else "")
+
             placeholders = {
                 "run_id": job.name,
                 "host": request["host"],
@@ -1267,6 +1332,8 @@ def worker(root, job):
                 "artifacts": str(job / "artifacts"),
                 "code": str(workdir),
                 "python": effective_python or shutil.which("python3", path=env.get("PATH", "")) or sys.executable,
+                "git_commit": git_commit,
+                "git_branch": git_branch,
             }
             for alias, binding in request["shared"].items():
                 placeholders[f"shared.{alias}.path"] = shared_paths[alias]
@@ -1280,6 +1347,9 @@ def worker(root, job):
                 "REMOTE_RUN_ARTIFACTS": str(job / "artifacts"),
                 "REMOTE_RUN_CODE": str(workdir),
                 "REMOTE_RUN_PYTHON": placeholders["python"],
+                "REMOTE_RUN_GIT_COMMIT": git_commit,
+                "REMOTE_RUN_GIT_BRANCH": git_branch,
+                "REMOTE_RUN_GIT_DIRTY": git_dirty,
             })
             for alias, binding in request["shared"].items():
                 prefix = "REMOTE_RUN_SHARED_" + re.sub(r"[^A-Z0-9]+", "_", alias.upper()).strip("_")
@@ -1440,15 +1510,19 @@ def sync_workspace(repo_root, proj_cfg, host, ws_info, *, run_id="", delete=Fals
 def wait_for_status(host, run_id, wait_sec, *, offset=None, tail_bytes=8192, raw_log=False):
     if not math.isfinite(wait_sec) or wait_sec < 0:
         raise ValueError("--wait must be a finite non-negative number of seconds")
-    deadline = time.monotonic() + wait_sec
-    res = ssh_call(host, "status", {
-        "run_id": run_id, "include_log": True, "offset": offset, "tail_bytes": tail_bytes, "raw_log": raw_log,
-    })
-    while res["status"] not in TERMINAL and time.monotonic() < deadline:
-        time.sleep(min(0.6, max(0.05, deadline - time.monotonic())))
-        res = ssh_call(host, "status", {
-            "run_id": run_id, "include_log": True, "offset": offset, "tail_bytes": tail_bytes, "raw_log": raw_log,
-        })
+    res = ssh_call(
+        host,
+        "status",
+        {
+            "run_id": run_id,
+            "include_log": True,
+            "offset": offset,
+            "tail_bytes": tail_bytes,
+            "raw_log": raw_log,
+            "wait_sec": wait_sec,
+        },
+        timeout=max(60, int(wait_sec) + 30),
+    )
     res["detached"] = res["status"] not in TERMINAL
     if res["detached"]:
         res["next_action"] = (
@@ -1468,12 +1542,37 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
     if not math.isfinite(args.wait) or args.wait < 0:
         raise ValueError("--wait must be a finite non-negative number of seconds")
 
-    ws_info = resolve_workspace(
-        repo_root, proj_cfg, host,
-        rel_subdir=rel_subdir, in_git=args._in_git,
-        workspace_override=args.workspace or "", remote_dir_override=args.remote_dir or "",
-        ignore_share_project=bool(args.no_sync),
-    )
+    if getattr(args, "_no_project_mode", False):
+        explicit_dir = args.remote_dir or proj_cfg["remote_dir"]
+        if explicit_dir:
+            ws_info = {
+                "project_id": "", "workspace_id": "", "managed": False,
+                "workdir": remote_path(explicit_dir, "remote_dir"), "shared_dir": "", "rel_subdir": "",
+                "in_git": False, "branch": "", "root_commit": "",
+                "git_commit": "", "git_branch": "", "git_dirty": False,
+            }
+        elif args.session:
+            wdir = str(Path(host["root"]) / "projects" / "_adhoc" / "workspaces" / "default")
+            ws_info = {
+                "project_id": "_adhoc", "workspace_id": "default", "managed": True,
+                "workdir": wdir, "shared_dir": "", "rel_subdir": "",
+                "in_git": False, "branch": "", "root_commit": "",
+                "git_commit": "", "git_branch": "", "git_dirty": False,
+            }
+        else:
+            ws_info = {
+                "project_id": "", "workspace_id": "", "managed": True,
+                "workdir": host["root"], "shared_dir": "", "rel_subdir": "",
+                "in_git": False, "branch": "", "root_commit": "",
+                "git_commit": "", "git_branch": "", "git_dirty": False,
+            }
+    else:
+        ws_info = resolve_workspace(
+            repo_root, proj_cfg, host,
+            rel_subdir=rel_subdir, in_git=args._in_git,
+            workspace_override=args.workspace or "", remote_dir_override=args.remote_dir or "",
+            ignore_share_project=bool(args.no_sync),
+        )
     env_name = args.env or proj_cfg["env"] or host["default_env"]
     env_cfg = resolve_env(host, env_name)
     shared_specs = list(proj_cfg["share"]["host"]) + list(args.shared)
@@ -1525,6 +1624,9 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         "fallback_root": fallback_root,
         "project_id": ws_info["project_id"],
         "workspace_id": ws_info["workspace_id"],
+        "git_commit": ws_info.get("git_commit", ""),
+        "git_branch": ws_info.get("git_branch", ""),
+        "git_dirty": bool(ws_info.get("git_dirty", False)),
         "session": session_name_user,
         "session_key": session_key,
         "command": [] if args.shell else cmd,
@@ -1563,9 +1665,12 @@ def handle_pull(args, host):
         raise ValueError(f"Destination already exists (use a new directory or --force): {dest}")
     if not math.isfinite(args.max_file_mb) or args.max_file_mb < 0:
         raise ValueError("--max-file-mb must be a finite non-negative number")
+    paths_only = bool(getattr(args, "paths_only", False))
+    if paths_only and not args.path:
+        raise ValueError("--paths-only requires at least one --path")
     meta = ssh_call(host, "pull", {
         "run_id": args.run_id, "all_artifacts": args.all_artifacts,
-        "max_file_mb": args.max_file_mb, "paths": args.path,
+        "max_file_mb": args.max_file_mb, "paths": args.path, "paths_only": paths_only,
     })
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".remote-run-pull-", dir=dest.parent) as stage:
@@ -1673,6 +1778,7 @@ def cli():
     pl_p.add_argument("--all-artifacts", action="store_true", help="Include checkpoint files and artifacts exceeding --max-file-mb")
     pl_p.add_argument("--max-file-mb", type=float, default=10.0, help="Max artifact file size in MB when --all-artifacts is unset (default: 10)")
     pl_p.add_argument("--path", action="append", default=[], help="Relative path inside remote workspace to pull into DEST/workspace/ (repeatable)")
+    pl_p.add_argument("--paths-only", action="store_true", help="Pull only --path workspace files without re-fetching job logs/artifacts")
     pl_p.add_argument("--force", action="store_true", help="Merge pulled files into an existing destination directory without deleting other files")
 
     se_p = sub.add_parser("session", parents=[common], help="List or reset opt-in persistent shell sessions")
@@ -1701,11 +1807,13 @@ def cli():
         return {"default_host": default_host, "config_path": str(config_path), "hosts": hosts}, pretty, False
 
     if args.action in ("config", "sync", "exec"):
+        args._no_project_mode = False
         if args.action == "exec" and args.no_project:
             if not args.no_sync:
                 raise ValueError("--no-project can only be used with --no-sync")
             repo_root, rel_subdir, in_git = Path.cwd(), "", False
             proj_cfg = empty_project_config()
+            args._no_project_mode = True
         elif (
             args.action == "exec"
             and args.no_sync
@@ -1717,6 +1825,7 @@ def cli():
             proj_cfg = empty_project_config()
             if cwd_proj and cwd_proj["host"]:
                 proj_cfg["host"] = cwd_proj["host"]
+            args._no_project_mode = True
         else:
             repo_arg = args.repo if args.repo is not None else Path.cwd()
             repo_root, rel_subdir, in_git = resolve_repo_context(repo_arg)
@@ -1815,14 +1924,12 @@ def cli():
 
 
 if "PAYLOAD" in globals():
-    os.umask(0o077)
     try:
         print(json.dumps(control(PAYLOAD), ensure_ascii=False))
     except (ValueError, KeyError, OSError, RuntimeError, OverflowError, subprocess.TimeoutExpired) as error:
         print(f"remote-run: {error}", file=sys.stderr)
         raise SystemExit(1)
 elif __name__ == "__main__":
-    os.umask(0o077)
     try:
         if sys.argv[1:2] == ["_worker"]:
             worker(Path(sys.argv[2]), Path(sys.argv[3]))

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Standardized zero-dependency MCP stdio server wrapping remote_run.py."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 
 CLI = str(Path(__file__).resolve().parent / "remote_run.py")
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+STDOUT_LOCK = threading.Lock()
 
 TOOLS = [
     {
@@ -147,6 +150,7 @@ TOOLS = [
                 "all_artifacts": {"type": "boolean", "description": "Include checkpoint files and artifacts exceeding max_file_mb"},
                 "max_file_mb": {"type": "number", "description": "Max artifact size in MB when all_artifacts=false"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative paths inside remote workspace to pull"},
+                "paths_only": {"type": "boolean", "description": "Pull only requested workspace paths without re-fetching job logs/artifacts (requires paths)"},
                 "force": {"type": "boolean", "description": "Merge pulled files into an existing destination directory without deleting other files"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
@@ -316,6 +320,8 @@ def call_tool(name, a):
             argv.extend(["--max-file-mb", str(float(a["max_file_mb"]))])
         for p in (a.get("paths") or []):
             argv.extend(["--path", str(p)])
+        if a.get("paths_only"):
+            argv.append("--paths-only")
         if a.get("force"):
             argv.append("--force")
         return run_cli(argv, timeout=360)
@@ -348,49 +354,56 @@ def respond(msg_id, result=None, error=None):
         payload["error"] = error
     else:
         payload["result"] = result
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with STDOUT_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+def handle_tool_call(msg_id, params):
+    try:
+        respond(msg_id, call_tool(params.get("name", ""), params.get("arguments", {})))
+    except (KeyError, TypeError, ValueError, OverflowError, OSError, subprocess.TimeoutExpired) as exc:
+        respond(msg_id, {"content": [{"type": "text", "text": f"Tool error: {exc}"}], "isError": True})
 
 
 def main():
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as exc:
-            respond(None, error={"code": -32700, "message": f"Parse error: {exc}"})
-            continue
-        if not isinstance(req, dict):
-            respond(None, error={"code": -32600, "message": "Invalid Request: expected JSON object"})
-            continue
-        msg_id = req.get("id")
-        method = req.get("method", "")
-        params = req.get("params") or {}
-        if not isinstance(params, dict):
-            params = {}
-        if method in ("notifications/initialized", "notifications/cancelled") or msg_id is None:
-            continue
-        if method == "initialize":
-            req_ver = params.get("protocolVersion", "2024-11-05")
-            proto = req_ver if req_ver in SUPPORTED_PROTOCOLS else "2024-11-05"
-            respond(msg_id, {
-                "protocolVersion": proto,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "remote-run", "version": "0.3.0"},
-            })
-        elif method == "ping":
-            respond(msg_id, {})
-        elif method == "tools/list":
-            respond(msg_id, {"tools": TOOLS})
-        elif method == "tools/call":
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                respond(msg_id, call_tool(params.get("name", ""), params.get("arguments", {})))
-            except (KeyError, TypeError, ValueError, OverflowError, OSError, subprocess.TimeoutExpired) as exc:
-                respond(msg_id, {"content": [{"type": "text", "text": f"Tool error: {exc}"}], "isError": True})
-        else:
-            respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
+                req = json.loads(line)
+            except json.JSONDecodeError as exc:
+                respond(None, error={"code": -32700, "message": f"Parse error: {exc}"})
+                continue
+            if not isinstance(req, dict):
+                respond(None, error={"code": -32600, "message": "Invalid Request: expected JSON object"})
+                continue
+            msg_id = req.get("id")
+            method = req.get("method", "")
+            params = req.get("params") or {}
+            if not isinstance(params, dict):
+                params = {}
+            if method in ("notifications/initialized", "notifications/cancelled") or msg_id is None:
+                continue
+            if method == "initialize":
+                req_ver = params.get("protocolVersion", "2024-11-05")
+                proto = req_ver if req_ver in SUPPORTED_PROTOCOLS else "2024-11-05"
+                respond(msg_id, {
+                    "protocolVersion": proto,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "remote-run", "version": "0.4.0"},
+                })
+            elif method == "ping":
+                respond(msg_id, {})
+            elif method == "tools/list":
+                respond(msg_id, {"tools": TOOLS})
+            elif method == "tools/call":
+                pool.submit(handle_tool_call, msg_id, params)
+            else:
+                respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
 
 if __name__ == "__main__":

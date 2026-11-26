@@ -9,7 +9,7 @@ description: >-
 
 # remote-run
 
-Local editing and quick checks stay on the laptop. Use the `remote-run` CLI (or `remote_*` MCP tools only if already present in your active toolset) whenever the user wants work executed on a remote compute host (e.g., `desktop` or `cpu_box`).
+Local editing and quick checks stay on the laptop. Use the `remote-run` CLI (or `remote_*` MCP tools only if already loaded in your active toolset — CLI and MCP are equivalent, so avoid extra schema reads for one-off status/host checks) whenever the user wants work executed on a remote compute host (e.g., `desktop` or `cpu_box`).
 
 ## Safety Rules (Read First)
 
@@ -40,7 +40,7 @@ Local editing and quick checks stay on the laptop. Use the `remote-run` CLI (or 
    remote-run exec -- python train.py --epochs 10
    remote-run exec --host cpu_box -- bash run.sh "arg with space"
    ```
-   - **Quick monitoring & remote-direct heavy setup/downloads** (skips laptop upload and GPU lock — download HuggingFace/DVC datasets, unpack archives, or run `uv sync` directly on the remote host instead of pulling through the laptop first; pass `--remote-dir` only when the user gives a specific path):
+   - **Quick monitoring & remote-direct heavy setup/downloads** (skips laptop upload and GPU lock, and sets `CUDA_VISIBLE_DEVICES=""` / `REMOTE_RUN_DEVICE=cpu` so `--no-gpu` commands cannot collide on VRAM; `nvidia-smi` still works — download HuggingFace/DVC datasets, unpack archives, or run `uv sync` directly on the remote host instead of pulling through the laptop first; pass `--remote-dir` only when the user gives a specific path):
      ```bash
      remote-run exec --no-sync --no-gpu -- nvidia-smi
      remote-run exec --host cpu_box --no-sync --remote-dir /path/on/remote --shell "hf download ..."
@@ -53,17 +53,19 @@ Local editing and quick checks stay on the laptop. Use the `remote-run` CLI (or 
      ```
 3. **Environment variables injected on the remote host**:
    - `REMOTE_RUN_ID`, `REMOTE_RUN_HOST`, `REMOTE_RUN_DEVICE` (`cuda:0` or `cpu`; multi-GPU `cuda:N` sets `CUDA_VISIBLE_DEVICES=N` unless overridden), `REMOTE_RUN_ARTIFACTS` (job-isolated artifact dir), `REMOTE_RUN_CODE` (remote workspace dir), `REMOTE_RUN_PYTHON`
+   - `REMOTE_RUN_GIT_COMMIT` (40-hex `HEAD`), `REMOTE_RUN_GIT_BRANCH`, `REMOTE_RUN_GIT_DIRTY` (`1`/`0`; populated when launched from a Git repo since `/.git/` is excluded from upload)
    - For bound host shared assets (`--shared [ALIAS=]NAME` or `[share].host`): `REMOTE_RUN_SHARED_<ALIAS>_PATH`, `_NAME`, `_VERSION`, `_SHA256`
 4. **Long-running jobs, status, cancel, pull, and prune**:
    - **Run statuses**: `queued`, `running`, and terminal states `completed`, `failed`, `cancelled`, `interrupted`.
    - When `detached: true`, immediately report `run_id`, `host`, `device`, `workdir`, and `next_action`.
+   - **Monitoring tip**: `--wait` blocks on the remote host over a single SSH connection. In harnesses that wake up on background shell completion, run `remote-run status RUN_ID --wait 3600` in the background so you wake up immediately when the job ends instead of juggling timers. When polling manually, prefer default tail or pass `--offset <next_offset>` instead of re-reading from `--offset 0`.
    ```bash
    remote-run status RUN_ID --wait 30
    remote-run status --repo .                     # list recent runs for this project
    remote-run status RUN_ID --offset 8192 --raw-log
    remote-run cancel RUN_ID                       # kills process group (even while queued), frees VRAM
    remote-run pull RUN_ID ./results/RUN_ID
-   remote-run pull RUN_ID ./results/RUN_ID --path reports/bench.md --force
+   remote-run pull RUN_ID ./results/RUN_ID --path reports/bench.md --paths-only --force
    remote-run sync --dry-run --delete             # preview stale remote files before explicit --delete
    remote-run prune --days 14                     # dry-run; ask user before running --apply
    ```

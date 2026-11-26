@@ -24,7 +24,9 @@ Only create when needed. Allowed top-level keys ONLY:
 - `remote_dir` (explicit remote folder override; cannot be combined with `[share].project`)
 - `[sync]`: `use_gitignore` (bool, default `true`), `ignore` (list), `preserve` (list)
 - `[share]`: `project` (rel dirs shared across all worktrees of this project via symlinks into `.../shared/<name>`), `host` (list of host asset names or `"alias=name"`)
-- `[env_vars]`: string map supporting `{run_id}`, `{host}`, `{device}`, `{artifacts}`, `{code}`, `{python}`, `{shared.<alias>.path|version|sha256}` (placeholders expand ONLY here and in `--env-var`, never in `--shell` or command args)
+- `[env_vars]`: string map supporting `{run_id}`, `{host}`, `{device}`, `{artifacts}`, `{code}`, `{python}`, `{git_commit}`, `{git_branch}`, `{shared.<alias>.path|version|sha256}` (placeholders expand ONLY here and in `--env-var`, never in `--shell` or command args). On remote execution, `REMOTE_RUN_GIT_COMMIT`, `REMOTE_RUN_GIT_BRANCH`, and `REMOTE_RUN_GIT_DIRTY` (`1`/`0`) are also injected automatically.
+
+**Tip (Multi-GB Shared Datasets)**: Copy large read-only datasets directly to the remote host once with `rsync -avh --progress ./local_data/ <ssh_host>:/path/to/shared_data/`, compute a `manifest.json` SHA-256 on the host, and register `[hosts.<name>.shared.<asset>]` in `hosts.toml` (define under each host alias sharing that machine).
 
 Validate anytime with `remote-run config`.
 
