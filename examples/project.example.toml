@@ -2,23 +2,26 @@
 # Delete any field you do not need; projects without this file run out of the box.
 schema_version = 1
 
-# project = "my-project"
-# host = "desktop"
-# env = "venv"                          # "venv", "none", or an env name from hosts.toml
-# workspace = "default"                 # optional: share one remote dir across local git checkout branches
-# remote_dir = "/data/your-user/custom" # optional fixed remote directory override
+# project = "my-project"                  # Optional fixed project ID across local folder renames
+# host = "server"                         # Default host profile from hosts.toml
+# env = "venv"                            # "venv", "none", or a named env from hosts.toml
+# workspace = "default"                   # Note: normal single-checkout repos already default to "default";
+                                          # linked Git worktrees auto-isolate by branch unless overridden here.
+# remote_dir = "/data/your-user/custom"   # Explicit remote dir override (cannot combine with [share].project)
 
 [sync]
-use_gitignore = true
-ignore = ["docs/", "papers/"]
-preserve = ["outputs/", "checkpoints/", "reports/"]
+use_gitignore = true                      # Respect local .gitignore rules when uploading
+ignore = ["docs/", "papers/"]             # Local-only paths skipped during upload
+# Built-in preserve: .venv, outputs, checkpoints, .cache (never uploaded, never deleted)
+preserve = ["target/", "build/", "reports/"]
 
 [share]
-# Directories shared across all worktrees/branches of this project on the remote host:
-# project = ["cache", "pretrained"]
-# Host-level shared assets from hosts.toml ("name" or "alias=name"):
+# Project directories shared across all linked Git worktrees via remote symlinks (auto-preserved):
+# project = ["cache", "assets"]
+# Host-level shared assets from hosts.toml ("name" or "alias=name"; injects env vars only, NO symlinks):
 # host = ["hf-cache"]
 
 [env_vars]
-# Supports {run_id}, {host}, {device}, {artifacts}, {code}, {python}, {shared.<alias>.path|version|sha256}
+# Supports {run_id}, {host}, {device}, {artifacts}, {code}, {python},
+#          {git_commit}, {git_branch}, {shared.<alias>.path|version|sha256}
 # OUTPUT_DIR = "{artifacts}"

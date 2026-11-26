@@ -64,6 +64,45 @@ class RemoteRunTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not in envs"):
                 rr.load_hosts_config(cfg)
 
+            # Minimal hosts.toml (only ssh required; root defaults to ~/.local/share/remote-run, device defaults to cpu)
+            cfg.write_text('schema_version = 1\n[hosts.minbox]\nssh = "ubuntu@192.168.1.50"\nport = 22345\n')
+            dhost, mhosts = rr.load_hosts_config(cfg)
+            self.assertEqual(dhost, "minbox")
+            self.assertEqual(mhosts["minbox"]["port"], 22345)
+            self.assertEqual(mhosts["minbox"]["root"], rr.DEFAULT_REMOTE_ROOT)
+            self.assertEqual(mhosts["minbox"]["device"], "cpu")
+            self.assertEqual(mhosts["minbox"]["gpu_slots"], [])
+
+            # Safe ssh / path / device / port / sha256 validation
+            for bad_ssh in ("-oProxyCommand=evil", "user@host:2222", "bad host"):
+                with self.assertRaises(ValueError):
+                    rr.ssh_target(bad_ssh)
+            for bad_path in ("~", "~/", "~/.", "~bob/dir", "/data/../etc", "relative/path"):
+                with self.assertRaises(ValueError):
+                    rr.remote_path(bad_path)
+            self.assertEqual(rr.remote_path("~/jobs/"), "~/jobs")
+            self.assertEqual(rr.expand_remote_path("~/jobs/"), str(Path.home() / "jobs"))
+
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                rr.validate_device("cuda:0,0")
+            self.assertEqual(rr.device_gpu_slots("cuda:2,0"), ["gpu-0", "gpu-2"])
+            self.assertEqual(rr.device_gpu_slots("cpu"), [])
+
+            cfg.write_text(
+                'schema_version = 1\ndefault_host = "box"\n'
+                '[hosts.box]\nssh = "box"\nroot = "/data/jobs"\nport = 70000\n'
+            )
+            with self.assertRaisesRegex(ValueError, "1 and 65535"):
+                rr.load_hosts_config(cfg)
+
+            cfg.write_text(
+                'schema_version = 1\ndefault_host = "box"\n'
+                '[hosts.box]\nssh = "box"\nroot = "/data/jobs"\n'
+                f'[hosts.box.shared.ds]\npath = "/data/ds"\nsha256 = "{"A" * 64}"\n'
+            )
+            _, shosts = rr.load_hosts_config(cfg)
+            self.assertEqual(shosts["box"]["shared"]["ds"]["sha256"], "a" * 64)
+
             cfg.write_text(
                 'schema_version = 1\ndefault_host = "box"\n'
                 '[hosts.box]\nssh = "box"\nroot = "/data/jobs"\npath_prepend = ["/home/u/.local/bin"]\ndefault_env = "venv"\n'
@@ -132,9 +171,12 @@ class RemoteRunTests(unittest.TestCase):
             proj_cfg = rr.load_project_config(root_found)
             ws1 = rr.resolve_workspace(root_found, proj_cfg, host, rel_subdir=rel_sub, in_git=True)
             self.assertTrue(ws1["project_id"].startswith("my-app-"))
+            self.assertEqual(ws1["workspace_id"], "default")
+            self.assertFalse(ws1["is_linked_worktree"])
 
             moved = p2 / "my-app"
             repo.rename(moved)
+            rr.run(["git", "checkout", "-qb", "local-feature"], cwd=moved)
             ws2 = rr.resolve_workspace(moved, proj_cfg, host, in_git=True)
             self.assertEqual(ws1["workdir"], ws2["workdir"])
 
@@ -144,6 +186,7 @@ class RemoteRunTests(unittest.TestCase):
             rr.run(["git", "worktree", "add", "-q", "-b", "feat/a/b", str(wt2)], cwd=moved)
             w_a = rr.resolve_workspace(wt1, proj_cfg, host, in_git=True)
             w_b = rr.resolve_workspace(wt2, proj_cfg, host, in_git=True)
+            self.assertTrue(w_a["is_linked_worktree"])
             self.assertEqual(w_a["project_id"], w_b["project_id"])
             self.assertNotEqual(w_a["workspace_id"], w_b["workspace_id"])
             self.assertNotEqual(w_a["workdir"], w_b["workdir"])
@@ -256,11 +299,13 @@ class RemoteRunTests(unittest.TestCase):
             (job / "artifacts").mkdir(parents=True)
             (job / "state.json").write_text("{}")
             (job / "artifacts" / "metrics_[0].json").write_text("{}")
+            (job / "artifacts" / "firmware.bin").write_bytes(b"ELF")
             (job / "artifacts" / "model.pt").write_text("pt")
             (job / "artifacts" / "big.txt").write_bytes(b"x" * 2048)
 
             j_def, _, skip_def = rr.eligible_pull_files(job, str(root), max_file_mb=0.001)
             self.assertIn("artifacts/metrics_[0].json", j_def)
+            self.assertIn("artifacts/firmware.bin", j_def)
             self.assertEqual({s["path"] for s in skip_def}, {"artifacts/model.pt", "artifacts/big.txt"})
 
             j_all, _, skip_all = rr.eligible_pull_files(job, str(root), all_artifacts=True, max_file_mb=0.001)
@@ -672,10 +717,12 @@ class RemoteRunTests(unittest.TestCase):
             self.assertEqual(errs[0]["error"]["code"], -32700)
             self.assertEqual(errs[1]["error"]["code"], -32600)
             self.assertEqual(by_id[1]["result"]["protocolVersion"], "2025-03-26")
-            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "0.4.0")
+            self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "0.5.0")
             tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
             self.assertIn("remote_prune", tools)
             self.assertIn("repo", tools["remote_doctor"]["inputSchema"]["properties"])
+            self.assertIn("check_cmds", tools["remote_doctor"]["inputSchema"]["properties"])
+            self.assertIn("device", tools["remote_exec"]["inputSchema"]["properties"])
             self.assertIn("paths_only", tools["remote_pull"]["inputSchema"]["properties"])
             self.assertIn("annotations", tools["remote_exec"])
             self.assertTrue(tools["remote_exec"]["annotations"]["destructiveHint"])
@@ -830,6 +877,358 @@ class RemoteRunTests(unittest.TestCase):
             self.assertEqual(d_other["status"], "ready")
             self.assertEqual(mssh.call_args.args[0]["name"], "other")
             self.assertEqual(mssh.call_args.args[2]["shared"], {})
+
+    def test_control_path_prepend_no_git_check_cmd_cpu_clean_and_runs_0700(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            r = base / "root"
+            rr.ensure_root_owned(r, init_root=True)
+            bin_dir = base / "custom_bin"
+            bin_dir.mkdir()
+            tool = bin_dir / "g++"
+            tool.write_text("#!/bin/sh\necho ok\n")
+            tool.chmod(0o755)
+            # host without git in PATH still succeeds if bash, tmux, rsync exist
+            fake_bin = base / "fake_sys_bin"
+            fake_bin.mkdir()
+            for cmd_name in ("bash", "tmux", "rsync"):
+                p = fake_bin / cmd_name
+                p.write_text("#!/bin/sh\nexit 0\n")
+                p.chmod(0o755)
+            host = {"name": "h", "root": str(r), "locks_dir": str(r / "locks"), "device": "cpu", "path_prepend": [str(bin_dir)]}
+            with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+                doc_ok = rr.control({"action": "doctor", "host": host, "env_name": "none", "python": "", "check_cmds": ["g++"]})
+                self.assertEqual(doc_ok["status"], "ready")
+                self.assertEqual(doc_ok["commands"]["g++"], str(tool))
+                doc_miss = rr.control({"action": "doctor", "host": host, "env_name": "none", "python": "", "check_cmds": ["g++", "nonexistent_tool_xyz"]})
+                self.assertEqual(doc_miss["status"], "missing_commands")
+                self.assertTrue(doc_miss["_exec_failed"])
+                self.assertEqual(doc_miss["missing_commands"], ["nonexistent_tool_xyz"])
+
+            # CPU worker does NOT inject CUDA_VISIBLE_DEVICES or CUBLAS_WORKSPACE_CONFIG, and runs/ is 0700
+            job = r / "runs" / "rr-cpu-clean"
+            wdir = r / "ws_cpu"
+            src = (ROOT / "remote_run.py").read_text()
+            req = {
+                "host": "h", "device": "cpu", "physical_device": "cpu", "gpu_slot": "", "gpu_slots": [],
+                "locks_dir": str(r / "locks"), "use_gpu": False, "env_name": "none",
+                "python": "", "auto_venv": False, "path_prepend": [], "env_static": {},
+                "env_vars": {}, "shared": {}, "workdir": str(wdir), "shared_dir": "", "rel_subdir": "",
+                "project_id": "p", "workspace_id": "default", "session": "", "session_key": "",
+                "shell": "python3 -c \"import os; print('CVD' if 'CUDA_VISIBLE_DEVICES' in os.environ else 'NO_CVD', 'CUBLAS' if 'CUBLAS_WORKSPACE_CONFIG' in os.environ else 'NO_CUBLAS')\"",
+                "command": [],
+            }
+            with mock.patch.object(rr, "run", return_value=""), \
+                 mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(returncode=0)):
+                sub_res = rr.remote_submit(r, job, host, req, src)
+            self.assertEqual((r / "runs").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(sub_res["tmux_session"], rr.session_name(r, "rr-cpu-clean"))
+            clean_env = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "CUBLAS_WORKSPACE_CONFIG")}
+            wproc = subprocess.run(
+                [sys.executable, "-B", str(ROOT / "remote_run.py"), "_worker", str(r), str(job)],
+                env=clean_env, capture_output=True, text=True, check=True,
+            )
+            self.assertIn("NO_CVD NO_CUBLAS", wproc.stdout)
+
+    def test_ssh_control_master_rsync_fallback_and_init_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            fake_home = base / "home"
+            fake_home.mkdir()
+            host = {"ssh": "box", "port": 2222}
+            with mock.patch.object(rr.Path, "home", return_value=fake_home), \
+                 mock.patch.dict(os.environ, {"REMOTE_RUN_SSH_CONTROL": "1"}):
+                argv = rr.build_ssh_argv(host)
+                self.assertIn("ControlMaster=auto", argv)
+                self.assertIn("ControlPersist=60", argv)
+                self.assertIn("-p", argv)
+                self.assertIn("2222", argv)
+                self.assertEqual((fake_home / ".cache" / "remote-run" / "ssh").stat().st_mode & 0o777, 0o700)
+            with mock.patch.dict(os.environ, {"REMOTE_RUN_SSH_CONTROL": "0"}):
+                argv_off = rr.build_ssh_argv(host)
+                self.assertNotIn("ControlMaster=auto", argv_off)
+
+            # macOS rsync fallback (no --protect-args)
+            rr.rsync_supports_protect_args.cache_clear()
+            with mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(stdout="rsync 2.6.9", stderr="")):
+                self.assertEqual(rr.rsync_protect_args(), [])
+                self.assertEqual(rr.rsync_remote_spec("box", "/tmp/dir with space"), "box:'/tmp/dir with space/'")
+            rr.rsync_supports_protect_args.cache_clear()
+
+            # remote-run init creates, appends, refuses duplicate without --force, updates with --force, handles dotted IPs & preserves existing parent mode
+            cfg = base / "cfg" / "hosts.toml"
+            existing_parent = base / "shared_parent"
+            existing_parent.mkdir(mode=0o755)
+            os.chmod(existing_parent, 0o755)
+            probe1 = {"status": "ok", "tools": {"bash": "/bin/bash", "tmux": "/usr/bin/tmux", "rsync": "/usr/bin/rsync"},
+                      "missing_tools": [], "device": "cuda:0", "gpus": [{"index": 0, "name": "GPU"}], "resolved_root": "/home/u/.local/share/remote-run"}
+            with mock.patch.object(rr, "ssh_call", return_value=probe1):
+                with mock.patch.object(sys, "argv", ["remote-run", "--config", str(cfg), "init", "ubuntu@10.0.0.2", "--port", "2222", "--name", "lab"]):
+                    out1, _, _ = rr.cli()
+            self.assertEqual(out1["host"], "lab")
+            self.assertEqual(out1["device"], "cuda:0")
+            self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
+            dh, hs = rr.load_hosts_config(cfg)
+            self.assertEqual(dh, "lab")
+            self.assertEqual(hs["lab"]["port"], 2222)
+            self.assertEqual(hs["lab"]["ssh"], "ubuntu@10.0.0.2")
+
+            # Dotted IP host without --name quotes TOML key properly and does not chmod pre-existing parent dir
+            ip_cfg = existing_parent / "hosts.toml"
+            with mock.patch.object(rr, "ssh_call", return_value=probe1):
+                with mock.patch.object(sys, "argv", ["remote-run", "--config", str(ip_cfg), "init", "ubuntu@192.168.1.50"]):
+                    out_ip, _, _ = rr.cli()
+            self.assertEqual(out_ip["host"], "192.168.1.50")
+            self.assertEqual(existing_parent.stat().st_mode & 0o777, 0o755)
+            dh_ip, hs_ip = rr.load_hosts_config(ip_cfg)
+            self.assertEqual(dh_ip, "192.168.1.50")
+            self.assertIn("192.168.1.50", hs_ip)
+
+            # Duplicate without --force raises
+            with mock.patch.object(rr, "ssh_call", return_value=probe1):
+                with mock.patch.object(sys, "argv", ["remote-run", "--config", str(cfg), "init", "ubuntu@10.0.0.2", "--name", "lab"]):
+                    with self.assertRaisesRegex(ValueError, "already exists"):
+                        rr.cli()
+
+            # Add second CPU host with --default, then force-update lab
+            probe2 = {**probe1, "device": "cpu", "gpus": []}
+            with mock.patch.object(rr, "ssh_call", return_value=probe2):
+                with mock.patch.object(sys, "argv", ["remote-run", "--config", str(cfg), "init", "cpu_srv", "--default"]):
+                    out2, _, _ = rr.cli()
+            self.assertEqual(out2["default_host"], "cpu_srv")
+            dh2, hs2 = rr.load_hosts_config(cfg)
+            self.assertEqual(dh2, "cpu_srv")
+            self.assertIn("lab", hs2)
+
+    def test_owned_manifest_ghost_cleanup_and_ignore_safety(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            remote_root = base / "remote_root"
+            rr.ensure_root_owned(remote_root, init_root=True)
+            repo = base / "repo"
+            repo.mkdir()
+            (repo / "src").mkdir()
+            (repo / "src" / "main.go").write_text("package main\n")
+            (repo / "src" / "old.go").write_text("package main\n")
+            (repo / "docs").mkdir()
+            (repo / "docs" / "guide.md").write_text("guide\n")
+
+            host_local = {"name": "h", "ssh": "unused", "root": str(remote_root), "locks_dir": str(remote_root / "locks"), "device": "cpu", "path_prepend": []}
+
+            def fake_ssh(_host, action, data):
+                return rr.control({"action": action, "host": host_local, **data})
+
+            def fake_local_rsync(cmd, **kwargs):
+                if cmd[0] == "rsync" and "-e" in cmd:
+                    src_dir = cmd[-2]
+                    dst_spec = cmd[-1]
+                    dst_dir = dst_spec.split(":", 1)[1].strip("'")
+                    idx_e = cmd.index("-e")
+                    clean_cmd = cmd[:idx_e] + cmd[idx_e + 2:-2] + [src_dir, dst_dir]
+                    return real_run(clean_cmd, **kwargs)
+                return real_run(cmd, **kwargs)
+
+            real_run = rr.run
+            proj_cfg = rr.load_project_config(repo)
+            ws_info = rr.resolve_workspace(repo, proj_cfg, host_local)
+            wdir = Path(ws_info["workdir"])
+
+            with mock.patch.object(rr, "ssh_call", side_effect=fake_ssh), mock.patch.object(rr, "run", side_effect=fake_local_rsync):
+                s1 = rr.sync_workspace(repo, proj_cfg, host_local, ws_info)
+            self.assertNotIn("pruned_ghost_files", s1)
+            self.assertTrue((wdir / "src" / "old.go").is_file())
+            self.assertTrue((wdir / "docs" / "guide.md").is_file())
+            self.assertTrue((wdir / rr.SYNCED_MANIFEST).is_file())
+
+            # Create remote-owned file and protected outputs/, then delete src/old.go and ignore docs/ (still on disk locally!)
+            (wdir / "remote_gen.txt").write_text("keep_me\n")
+            (wdir / "outputs").mkdir()
+            (wdir / "outputs" / "res.txt").write_text("keep_output\n")
+            (repo / "src" / "old.go").unlink()
+            (repo / "src" / "renamed.go").write_text("package main\n")
+            (repo / ".remote-run.toml").write_text('schema_version = 1\n[sync]\nignore = ["docs/"]\n')
+            proj_cfg2 = rr.load_project_config(repo)
+
+            with mock.patch.object(rr, "ssh_call", side_effect=fake_ssh), mock.patch.object(rr, "run", side_effect=fake_local_rsync):
+                dry = rr.sync_workspace(repo, proj_cfg2, host_local, ws_info, dry_run=True)
+                self.assertEqual(dry.get("would_prune_ghost"), ["src/old.go"])
+                s2 = rr.sync_workspace(repo, proj_cfg2, host_local, ws_info)
+            self.assertEqual(s2["pruned_ghost_files"], ["src/old.go"])
+            self.assertFalse((wdir / "src" / "old.go").exists())
+            self.assertTrue((wdir / "src" / "renamed.go").is_file())
+            # Newly ignored file still present locally MUST NOT be pruned!
+            self.assertTrue((wdir / "docs" / "guide.md").is_file())
+            self.assertTrue((wdir / "remote_gen.txt").is_file())
+            self.assertTrue((wdir / "outputs" / "res.txt").is_file())
+
+            # Defense-in-depth adversarial check on reconcile_synced_manifest
+            outside = base / "secret.txt"
+            outside.write_text("secret")
+            (wdir / "sym_link").symlink_to(outside)
+            rr.write_json(wdir / rr.SYNCED_MANIFEST, {
+                "schema_version": 1, "updated_at": rr.now(),
+                "files": ["outputs/res.txt", rr.WORKSPACE_MARKER, "../secret.txt", "sym_link"],
+            })
+            rec = rr.reconcile_synced_manifest(
+                remote_root, str(wdir), [], ["outputs/res.txt", rr.WORKSPACE_MARKER, "../secret.txt", "sym_link"], rr.BUILTIN_PRESERVE,
+            )
+            self.assertEqual(rec["pruned_ghost_files"], [])
+            self.assertTrue(outside.is_file())
+            self.assertTrue((wdir / "outputs" / "res.txt").is_file())
+            self.assertTrue((wdir / rr.WORKSPACE_MARKER).is_file())
+
+    def test_multi_gpu_sorted_locking_and_concurrency_stress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            ws = root / "ws"
+            ws.mkdir(parents=True)
+            rr.ensure_root_owned(root, init_root=True)
+            events_log = base / "events.jsonl"
+            file_lock = threading.Lock()
+
+            def run_gpu_worker(rid, dev):
+                job = root / "runs" / rid
+                (job / "artifacts").mkdir(parents=True)
+                slots = rr.device_gpu_slots(dev)
+                req = {
+                    "host": "h", "device": dev, "physical_device": dev,
+                    "gpu_slot": ",".join(slots), "gpu_slots": slots,
+                    "locks_dir": str(root / "locks"), "use_gpu": True, "env_name": "none",
+                    "python": "", "auto_venv": False, "path_prepend": [], "env_static": {},
+                    "env_vars": {}, "shared": {}, "workdir": str(ws), "shared_dir": "", "rel_subdir": "",
+                    "project_id": "p", "workspace_id": "default", "session": "", "session_key": "",
+                    "command": [
+                        sys.executable, "-c",
+                        (
+                            "import fcntl, json, os, time; "
+                            f"lp = {repr(str(events_log))}; "
+                            "t0 = time.monotonic(); time.sleep(0.18); t1 = time.monotonic(); "
+                            "rec = {'rid': os.environ['REMOTE_RUN_ID'], 'dev': os.environ['REMOTE_RUN_DEVICE'], "
+                            "'cvd': os.environ.get('CUDA_VISIBLE_DEVICES', ''), 't0': t0, 't1': t1}; "
+                            "fh = open(lp, 'a'); fcntl.flock(fh, fcntl.LOCK_EX); fh.write(json.dumps(rec)+'\\n'); fh.close()"
+                        ),
+                    ],
+                    "shell": "",
+                }
+                rr.write_json(job / "request.json", req)
+                rr.write_json(job / "state.json", {"run_id": rid, "status": "queued", "submitted_at": rr.now()})
+                subprocess.run(
+                    [sys.executable, "-B", str(ROOT / "remote_run.py"), "_worker", str(root), str(job)],
+                    capture_output=True, text=True, check=True, timeout=15,
+                )
+                return rr.read_json(job / "state.json")
+
+            specs = [("g0-a", "cuda:0"), ("g1-a", "cuda:1"), ("g01", "cuda:0,1"), ("g0-b", "cuda:0"), ("g1-b", "cuda:1")]
+            results = {}
+            threads = []
+            for rid, dev in specs:
+                def runner(r=rid, d=dev):
+                    st = run_gpu_worker(r, d)
+                    with file_lock:
+                        results[r] = st
+                t = threading.Thread(target=runner)
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join(timeout=20)
+                self.assertFalse(t.is_alive(), "Potential multi-GPU lock deadlock!")
+            self.assertEqual({k: v["status"] for k, v in results.items()}, {r: "completed" for r, _ in specs})
+
+            recs = {r["rid"]: r for r in (json.loads(line) for line in events_log.read_text().splitlines() if line.strip())}
+            self.assertEqual(recs["g01"]["cvd"], "0,1")
+            self.assertEqual(recs["g01"]["dev"], "cuda:0,1")
+            # cuda:0,1 must NEVER overlap in time with any cuda:0 or cuda:1 run
+            g01_t0, g01_t1 = recs["g01"]["t0"], recs["g01"]["t1"]
+            for other in ("g0-a", "g1-a", "g0-b", "g1-b"):
+                o_t0, o_t1 = recs[other]["t0"], recs[other]["t1"]
+                overlap = min(g01_t1, o_t1) - max(g01_t0, o_t0)
+                self.assertLessEqual(overlap, 0.01, f"g01 overlapped with {other} by {overlap}s!")
+
+    def test_scale_prune_non_blocking_combined_submit_follow_and_mcp_stress(self):
+        import fcntl
+        import io
+        import time
+        import remote_run_mcp as mcp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            rr.ensure_root_owned(root, init_root=True)
+            host = {"name": "h", "root": str(root), "locks_dir": str(root / "locks"), "device": "cpu", "path_prepend": []}
+
+            # Create 400 terminal runs + 1000 workspace files
+            runs_dir = root / "runs"
+            runs_dir.mkdir(parents=True)
+            ws_dir = root / "projects" / "p1" / "workspaces" / "default"
+            ws_dir.mkdir(parents=True)
+            for i in range(400):
+                jd = runs_dir / f"rr-term-{i:04d}"
+                jd.mkdir()
+                rr.write_json(jd / "request.json", {"host": "h", "device": "cpu", "workdir": str(ws_dir)})
+                rr.write_json(jd / "state.json", {"run_id": jd.name, "status": "completed"})
+            for j in range(1000):
+                (ws_dir / f"f{j:04d}.txt").write_text("x")
+
+            t0 = time.monotonic()
+            active = rr.active_runs_for_workdir(root, str(ws_dir))
+            t_active = time.monotonic() - t0
+            self.assertEqual(active, [])
+            self.assertLess(t_active, 2.0)
+
+            # Prune runs WITHOUT acquiring submit.lock and returns workspace paths without bytes rglob
+            with mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")):
+                with (root / "submit.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    p_res = rr.control({"action": "prune", "host": host, "days": 0.0, "apply": True})
+            self.assertEqual(p_res["runs_count"], 400)
+            self.assertEqual(p_res["workspaces"], [{"path": str(ws_dir)}])
+
+            # Streaming follow_run over multi-chunk wake_on_output + combined submit wait_sec
+            fjob = runs_dir / "rr-follow-1"
+            fjob.mkdir(parents=True)
+            rr.write_json(fjob / "request.json", {"host": "h", "device": "cpu", "workdir": str(ws_dir)})
+            rr.write_json(fjob / "state.json", {"run_id": "rr-follow-1", "status": "running", "started_at": rr.now()})
+            (fjob / "run.log").write_text("line1\n")
+
+            calls = {"n": 0}
+            def fake_follow_ssh(_host, action, data, **_kw):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    (fjob / "run.log").write_text("line1\nline2\n")
+                    rr.write_json(fjob / "state.json", {"run_id": "rr-follow-1", "status": "completed", "started_at": rr.now(), "finished_at": rr.now()})
+                return rr.control({"action": action, "host": host, **data})
+
+            cap = io.StringIO()
+            with mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                 mock.patch.object(rr, "ssh_call", side_effect=fake_follow_ssh), \
+                 mock.patch.object(sys, "stdout", cap):
+                f_res = rr.follow_run(host, "rr-follow-1")
+            self.assertEqual(f_res["status"], "completed")
+            self.assertEqual(cap.getvalue(), "line1\nline2\n")
+
+            # 16-way concurrent MCP stress test
+            cfg = base / "mcp_hosts.toml"
+            cfg.write_text(f'schema_version = 1\ndefault_host = "h"\n[hosts.h]\nssh = "s"\nroot = "{root}"\n')
+            reqs = "\n".join([
+                *(
+                    json.dumps({"jsonrpc": "2.0", "id": 100 + k, "method": "tools/call",
+                                "params": {"name": "remote_hosts", "arguments": {"config": str(cfg)}}})
+                    for k in range(16)
+                ),
+                json.dumps({"jsonrpc": "2.0", "id": 200, "method": "tools/call",
+                            "params": {"name": "remote_exec", "arguments": {"config": str(cfg), "repo": str(ROOT), "env_vars": ["bad"]}}}),
+                json.dumps({"jsonrpc": "2.0", "id": 201, "method": "tools/call",
+                            "params": {"name": "remote_exec", "arguments": {"config": str(cfg), "repo": str(ROOT), "command": "echo"}}}),
+            ]) + "\n"
+            out_buf = io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(reqs)), mock.patch.object(sys, "stdout", out_buf):
+                mcp.main()
+            resps = {json.loads(line)["id"]: json.loads(line) for line in out_buf.getvalue().strip().splitlines()}
+            self.assertEqual(set(resps), set(range(100, 116)) | {200, 201})
+            self.assertTrue(all(not resps[k]["result"]["isError"] for k in range(100, 116)))
+            self.assertTrue(resps[200]["result"]["isError"])
+            self.assertTrue(resps[201]["result"]["isError"])
 
 
 if __name__ == "__main__":

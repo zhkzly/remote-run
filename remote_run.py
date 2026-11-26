@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Cross-project persistent remote shell, smart sync, and GPU job runner."""
+"""Universal cross-project remote execution, safe sync, and persistent sessions over SSH."""
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import fcntl
+import functools
 import hashlib
 from hashlib import sha256
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
@@ -22,32 +23,45 @@ import tomllib
 from uuid import uuid4
 
 
+# === 1. Connectivity, Config & Environments ===
+
 SSH = [
     "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=7",
     "-o", "ConnectionAttempts=1", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes",
     "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no",
     "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
 ]
-TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
-CHECKPOINT_SUFFIXES = {".pt", ".pth", ".ckpt", ".bin", ".safetensors", ".onnx", ".h5"}
-ROOT_MARKER = ".remote-run-root.json"
-WORKSPACE_MARKER = ".remote-run-workspace.json"
-BUILTIN_IGNORE = [
-    ".venv/", "venv/", "__pycache__/", "*.pyc",
-    ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", "node_modules/", ".DS_Store", "/results/",
-]
-BUILTIN_PRESERVE = [".venv", "outputs", "checkpoints", ".cache"]
+DEFAULT_REMOTE_ROOT = "~/.local/share/remote-run"
 DEFAULT_CONFIG = Path.home() / ".config" / "remote-run" / "hosts.toml"
-SKIP_SESSION_ENV = {"_", "PWD", "OLDPWD", "SHLVL", "BASH_EXECUTION_STRING", "PPID"}
-SKIP_SESSION_PREFIXES = ("TMUX", "REMOTE_RUN_", "__RR_")
+DEVICE_RE = re.compile(r"^(?:cpu|cuda(?::[0-9]+(?:,[0-9]+)*)?)$")
 
 HOST_TOP_KEYS = {"schema_version", "default_host", "hosts"}
-HOST_ENTRY_KEYS = {"ssh", "root", "device", "gpu_slot", "locks_dir", "default_env", "path_prepend", "envs", "shared"}
+HOST_ENTRY_KEYS = {"ssh", "port", "root", "device", "gpu_slot", "locks_dir", "default_env", "path_prepend", "envs", "shared"}
 HOST_ENV_KEYS = {"python", "path_prepend", "env"}
 HOST_SHARED_KEYS = {"path", "manifest", "sha256", "version"}
 PROJECT_TOP_KEYS = {"schema_version", "project", "host", "env", "workspace", "remote_dir", "sync", "share", "env_vars"}
 PROJECT_SYNC_KEYS = {"use_gitignore", "ignore", "preserve"}
 PROJECT_SHARE_KEYS = {"project", "host"}
+
+
+# === 2. Workspace, Sync & Data Flow ===
+
+ROOT_MARKER = ".remote-run-root.json"
+WORKSPACE_MARKER = ".remote-run-workspace.json"
+SYNCED_MANIFEST = ".remote-run-synced.json"
+BUILTIN_IGNORE = [
+    ".venv/", "venv/", "__pycache__/", "*.pyc",
+    ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", "node_modules/", ".DS_Store", "/results/",
+]
+BUILTIN_PRESERVE = [".venv", "outputs", "checkpoints", ".cache"]
+CHECKPOINT_SUFFIXES = {".pt", ".pth", ".ckpt", ".safetensors", ".onnx", ".h5"}
+
+
+# === 3. Execution, Sessions & Lifecycle ===
+
+TERMINAL = {"completed", "failed", "interrupted", "cancelled"}
+SKIP_SESSION_ENV = {"_", "PWD", "OLDPWD", "SHLVL", "BASH_EXECUTION_STRING", "PPID"}
+SKIP_SESSION_PREFIXES = ("TMUX", "REMOTE_RUN_", "__RR_")
 
 
 def now():
@@ -71,6 +85,33 @@ def identifier(value, label="name"):
     return value
 
 
+def command_name(value, label="command"):
+    if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,63}", value):
+        raise ValueError(f"Invalid {label} {value!r}; pass a bare executable name without '/' or spaces")
+    return value
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
+
+
+def ssh_target(value, label="ssh"):
+    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value) or value.startswith("-"):
+        raise ValueError(f"Invalid {label} {value!r}; use a ~/.ssh/config alias or 'user@host'")
+    if ":" in value:
+        raise ValueError(
+            f"Invalid {label} {value!r}: ':' is not allowed here; set 'port = <number>' or use a ~/.ssh/config alias"
+        )
+    if "@" in value:
+        user, _, hostname = value.partition("@")
+        if not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}", user) or not re.fullmatch(
+            r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", hostname
+        ):
+            raise ValueError(f"Invalid {label} {value!r}; expected 'user@host' with safe characters")
+        return value
+    return identifier(value, label)
+
+
 def sanitize_id(value, fallback="item"):
     cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value)).strip(".-_")
     if not cleaned:
@@ -81,25 +122,78 @@ def sanitize_id(value, fallback="item"):
 
 
 def remote_path(value, label="path"):
-    if (not isinstance(value, str) or not value.startswith("/") or value.startswith("//")
-            or ".." in Path(value).parts or any(ord(c) < 32 for c in value)):
-        raise ValueError(f"Expected absolute remote {label} without '..': {value!r}")
-    norm = str(Path(value))
+    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
+        raise ValueError(f"Expected remote {label} starting with '/' or '~/': {value!r}")
+    if value.startswith("~/"):
+        sub = value[2:]
+        p = PurePosixPath(sub)
+        if not sub or p.is_absolute() or ".." in p.parts:
+            raise ValueError(f"Expected safe remote {label} under '~/': {value!r}")
+        norm = p.as_posix().strip("/")
+        if not norm or norm == ".":
+            raise ValueError(f"Refusing bare home directory '~/' as remote {label}")
+        return f"~/{norm}"
+    if value.startswith("~"):
+        raise ValueError(f"Use '~/subdir' (not bare {value!r}) or an absolute path like '/data/...' for remote {label}")
+    if not value.startswith("/") or value.startswith("//") or ".." in PurePosixPath(value).parts:
+        raise ValueError(f"Expected absolute remote {label} (or '~/subdir') without '..': {value!r}")
+    norm = str(PurePosixPath(value))
     if norm == "/":
         raise ValueError(f"Refusing filesystem root '/' as remote {label}")
     return norm
 
 
+def expand_remote_path(value, label="path"):
+    norm = remote_path(value, label)
+    if norm.startswith("~/"):
+        return str(Path.home() / norm[2:])
+    return norm
+
+
+def join_remote_path(base, *parts):
+    clean_base = remote_path(base, "path").rstrip("/")
+    tail = "/".join(p.strip("/") for p in parts if p.strip("/"))
+    return f"{clean_base}/{tail}" if tail else clean_base
+
+
 def rel_path(value, label="relative path"):
     if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
         raise ValueError(f"Invalid {label}: {value!r}")
-    p = Path(value)
+    p = PurePosixPath(value)
     if p.is_absolute() or ".." in p.parts or value in (".", "./"):
         raise ValueError(f"Expected safe relative {label}: {value!r}")
     norm = p.as_posix().strip("/")
     if not norm or norm == ".":
         raise ValueError(f"Invalid {label}: {value!r}")
     return norm
+
+
+# === 4. Resource & Concurrency Aspect ===
+
+def validate_device(value, label="device"):
+    if not isinstance(value, str) or not DEVICE_RE.fullmatch(value):
+        raise ValueError(f"{label} must be 'cpu', 'cuda', or 'cuda:N[,M...]'")
+    if ":" in value:
+        indices = value.partition(":")[2].split(",")
+        if len(indices) != len(set(indices)):
+            raise ValueError(f"{label} contains duplicate GPU index: {value!r}")
+    return value
+
+
+def slot_sort_key(slot):
+    if slot.startswith("gpu-") and slot.split("-", 1)[1].isdigit():
+        return (0, int(slot.split("-", 1)[1]), slot)
+    return (1, 0, slot)
+
+
+def device_gpu_slots(device, explicit_slot=""):
+    validate_device(device)
+    if device == "cpu":
+        return []
+    if explicit_slot:
+        return [identifier(explicit_slot, "gpu_slot")]
+    idx_part = device.partition(":")[2] or "0"
+    return sorted({f"gpu-{idx}" for idx in idx_part.split(",")}, key=slot_sort_key)
 
 
 def read_json(path):
@@ -125,9 +219,63 @@ def try_run(argv, *, cwd=None):
     return completed.returncode == 0, completed.stdout.strip()
 
 
+@functools.lru_cache(maxsize=1)
+def rsync_supports_protect_args():
+    completed = subprocess.run(["rsync", "--help"], capture_output=True, text=True)
+    return "--protect-args" in (completed.stdout + completed.stderr)
+
+
+def rsync_protect_args():
+    return ["--protect-args"] if rsync_supports_protect_args() else []
+
+
+def rsync_remote_spec(ssh_host, remote_dir):
+    path_str = f"{remote_dir.rstrip('/')}/"
+    return f"{ssh_host}:{path_str}" if rsync_supports_protect_args() else f"{ssh_host}:{shlex.quote(path_str)}"
+
+
+def build_ssh_argv(host):
+    argv = list(SSH)
+    if os.environ.get("REMOTE_RUN_SSH_CONTROL", "1") != "0":
+        ctl_dir = Path.home() / ".cache" / "remote-run" / "ssh"
+        ctl_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(ctl_dir, 0o700)
+        key = f"{host['ssh']}:{host.get('port') or ''}"
+        ctl_path = ctl_dir / f"cm-{sha256(key.encode()).hexdigest()[:16]}.sock"
+        argv.extend([
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60",
+            "-o", f"ControlPath={ctl_path}",
+        ])
+    if host.get("port"):
+        argv.extend(["-p", str(int(host["port"]))])
+    return argv
+
+
+def build_remote_path(base_path, prepend_dirs=()):
+    ordered = []
+    seen = set()
+
+    def add(item):
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+
+    for raw in prepend_dirs:
+        add(expand_remote_path(raw, "path_prepend"))
+    for entry in base_path.split(os.pathsep):
+        add(entry)
+    home = Path.home()
+    for std in (home / ".local" / "bin", home / ".cargo" / "bin", home / "go" / "bin", Path("/usr/local/go/bin")):
+        s = str(std)
+        if std.is_dir():
+            add(s)
+    return os.pathsep.join(ordered)
+
+
 def load_hosts_config(path):
     if not path.is_file():
-        raise ValueError(f"Host config not found: {path}")
+        raise ValueError(f"Host config not found: {path}. Run `remote-run init <ssh-target>` or create {path}")
     with path.open("rb") as f:
         cfg = tomllib.load(f)
     check_keys(cfg, HOST_TOP_KEYS, "hosts.toml")
@@ -140,15 +288,22 @@ def load_hosts_config(path):
     for hname, raw in hosts.items():
         identifier(hname, "host")
         check_keys(raw, HOST_ENTRY_KEYS, f"hosts.{hname}")
-        if "ssh" not in raw or "root" not in raw:
-            raise ValueError(f"hosts.{hname} requires 'ssh' and 'root'")
-        device = raw.get("device", "cpu")
-        if not isinstance(device, str) or not re.fullmatch(r"cpu|cuda(?::[0-9]+)?", device):
-            raise ValueError(f"hosts.{hname}.device must be 'cpu' or 'cuda[:N]'")
-        root = remote_path(raw["root"], "root")
-        locks_dir = remote_path(raw["locks_dir"], "locks_dir") if "locks_dir" in raw else str(Path(root) / "locks")
-        default_slot = ("gpu-" + (device.partition(":")[2] or "0")) if device.startswith("cuda") else ""
-        gpu_slot = identifier(raw["gpu_slot"], "gpu_slot") if raw.get("gpu_slot") else default_slot
+        if "ssh" not in raw:
+            raise ValueError(f"hosts.{hname} requires 'ssh'")
+        ssh = ssh_target(raw["ssh"], f"hosts.{hname}.ssh")
+        port = None
+        if "port" in raw:
+            port = raw["port"]
+            if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+                raise ValueError(f"hosts.{hname}.port must be an integer between 1 and 65535")
+        device = validate_device(raw.get("device", "cpu"), f"hosts.{hname}.device")
+        root = remote_path(raw["root"], "root") if "root" in raw else DEFAULT_REMOTE_ROOT
+        locks_dir = remote_path(raw["locks_dir"], "locks_dir") if "locks_dir" in raw else join_remote_path(root, "locks")
+        explicit_slot = raw.get("gpu_slot", "")
+        if explicit_slot:
+            identifier(explicit_slot, "gpu_slot")
+        gpu_slots = device_gpu_slots(device, explicit_slot)
+        gpu_slot = ",".join(gpu_slots) if gpu_slots else (explicit_slot if device == "cpu" and explicit_slot else "")
         host_pp = raw.get("path_prepend", [])
         if not isinstance(host_pp, list) or not all(isinstance(x, str) for x in host_pp):
             raise ValueError(f"hosts.{hname}.path_prepend must be a list of paths")
@@ -180,8 +335,10 @@ def load_hosts_config(path):
             if "path" not in sraw:
                 raise ValueError(f"hosts.{hname}.shared.{sname} requires 'path'")
             digest = sraw.get("sha256", "")
-            if digest and not re.fullmatch(r"[0-9a-f]{64}", digest):
-                raise ValueError(f"hosts.{hname}.shared.{sname}.sha256 must be 64 lowercase hex chars")
+            if digest:
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                    raise ValueError(f"hosts.{hname}.shared.{sname}.sha256 must be 64 hex chars")
+                digest = digest.lower()
             shared[sname] = {
                 "name": sname,
                 "path": remote_path(sraw["path"], "shared path"),
@@ -191,11 +348,13 @@ def load_hosts_config(path):
             }
         parsed[hname] = {
             "name": hname,
-            "ssh": identifier(raw["ssh"], "ssh"),
+            "ssh": ssh,
+            "port": port,
             "root": root,
             "locks_dir": locks_dir,
             "device": device,
             "gpu_slot": gpu_slot,
+            "gpu_slots": gpu_slots,
             "default_env": default_env,
             "path_prepend": host_path_prepend,
             "envs": envs,
@@ -205,6 +364,56 @@ def load_hosts_config(path):
     if default_host not in parsed:
         raise ValueError(f"default_host {default_host!r} not found in hosts")
     return default_host, parsed
+
+
+def render_hosts_toml(default_host, hosts):
+    lines = ["schema_version = 1", f"default_host = {json.dumps(default_host)}", ""]
+    for hname, h in hosts.items():
+        hk = toml_key(hname)
+        lines.append(f"[hosts.{hk}]")
+        lines.append(f"ssh = {json.dumps(h['ssh'])}")
+        if h.get("port"):
+            lines.append(f"port = {int(h['port'])}")
+        if h.get("root") and h["root"] != DEFAULT_REMOTE_ROOT:
+            lines.append(f"root = {json.dumps(h['root'])}")
+        default_locks = join_remote_path(h["root"], "locks")
+        if h.get("locks_dir") and h["locks_dir"] != default_locks:
+            lines.append(f"locks_dir = {json.dumps(h['locks_dir'])}")
+        if h.get("device") and h["device"] != "cpu":
+            lines.append(f"device = {json.dumps(h['device'])}")
+        auto_slots = ",".join(device_gpu_slots(h.get("device", "cpu")))
+        if h.get("gpu_slot") and h["gpu_slot"] != auto_slots:
+            lines.append(f"gpu_slot = {json.dumps(h['gpu_slot'])}")
+        if h.get("default_env"):
+            lines.append(f"default_env = {json.dumps(h['default_env'])}")
+        if h.get("path_prepend"):
+            lines.append(f"path_prepend = {json.dumps(h['path_prepend'])}")
+        lines.append("")
+        for ename, e in h.get("envs", {}).items():
+            ek = toml_key(ename)
+            lines.append(f"[hosts.{hk}.envs.{ek}]")
+            if e.get("python"):
+                lines.append(f"python = {json.dumps(e['python'])}")
+            if e.get("path_prepend"):
+                lines.append(f"path_prepend = {json.dumps(e['path_prepend'])}")
+            lines.append("")
+            if e.get("env"):
+                lines.append(f"[hosts.{hk}.envs.{ek}.env]")
+                for k, v in e["env"].items():
+                    lines.append(f"{toml_key(k)} = {json.dumps(v)}")
+                lines.append("")
+        for sname, s in h.get("shared", {}).items():
+            sk = toml_key(sname)
+            lines.append(f"[hosts.{hk}.shared.{sk}]")
+            lines.append(f"path = {json.dumps(s['path'])}")
+            if s.get("manifest"):
+                lines.append(f"manifest = {json.dumps(s['manifest'])}")
+            if s.get("sha256"):
+                lines.append(f"sha256 = {json.dumps(s['sha256'])}")
+            if s.get("version") and s["version"] != sname:
+                lines.append(f"version = {json.dumps(s['version'])}")
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def select_host(config_path, host_name=None):
@@ -299,6 +508,8 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
     branch = ""
     git_commit = ""
     git_dirty = False
+    is_linked_worktree = False
+    common_dir_path = None
     if in_git:
         ok_rc, rc_out = try_run(["git", "rev-list", "--max-parents=0", "HEAD"], cwd=repo_root)
         if ok_rc and rc_out:
@@ -316,15 +527,20 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
             ok_hd, hd_out = try_run(["git", "rev-parse", "--short=8", "HEAD"], cwd=repo_root)
             head_tag = hd_out if (ok_hd and hd_out) else "empty"
             branch = f"detached-{head_tag}-{sha256(str(repo_root).encode()).hexdigest()[:6]}"
+        ok_gd, gd_out = try_run(["git", "rev-parse", "--git-dir"], cwd=repo_root)
+        ok_cd, cd_out = try_run(["git", "rev-parse", "--git-common-dir"], cwd=repo_root)
+        if ok_gd and gd_out and ok_cd and cd_out:
+            gp = Path(gd_out)
+            cp = Path(cd_out)
+            g_res = (repo_root / gp).resolve() if not gp.is_absolute() else gp.resolve()
+            common_dir_path = (repo_root / cp).resolve() if not cp.is_absolute() else cp.resolve()
+            is_linked_worktree = g_res != common_dir_path
 
     if proj_cfg["project"]:
         project_id = proj_cfg["project"]
     elif in_git and root_commit:
-        ok_cd, cd_out = try_run(["git", "rev-parse", "--git-common-dir"], cwd=repo_root)
-        if ok_cd and cd_out:
-            cpath = Path(cd_out)
-            cpath = (repo_root / cpath).resolve() if not cpath.is_absolute() else cpath.resolve()
-            common_name = cpath.parent.name if cpath.name == ".git" else cpath.name.removesuffix(".git")
+        if common_dir_path is not None:
+            common_name = common_dir_path.parent.name if common_dir_path.name == ".git" else common_dir_path.name.removesuffix(".git")
         else:
             common_name = repo_root.name
         project_id = sanitize_id(f"{common_name[:55]}-{root_commit}", "project")
@@ -335,7 +551,7 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
     ws_chosen = workspace_override or proj_cfg.get("workspace", "")
     if ws_chosen:
         workspace_id = identifier(ws_chosen, "workspace")
-    elif in_git and branch:
+    elif in_git and is_linked_worktree and branch:
         if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", branch):
             workspace_id = branch
         else:
@@ -354,13 +570,14 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
         shared_dir = ""
         managed = False
     else:
-        wdir = str(Path(host["root"]) / "projects" / project_id / "workspaces" / workspace_id)
-        shared_dir = str(Path(host["root"]) / "projects" / project_id / "shared")
+        wdir = join_remote_path(host["root"], "projects", project_id, "workspaces", workspace_id)
+        shared_dir = join_remote_path(host["root"], "projects", project_id, "shared")
         managed = True
     return {
         "project_id": project_id, "workspace_id": workspace_id, "managed": managed,
         "workdir": wdir, "shared_dir": shared_dir, "rel_subdir": rel_subdir,
-        "in_git": in_git, "branch": branch, "root_commit": root_commit,
+        "in_git": in_git, "is_linked_worktree": is_linked_worktree,
+        "branch": branch, "root_commit": root_commit,
         "git_commit": git_commit, "git_branch": branch, "git_dirty": git_dirty,
     }
 
@@ -407,7 +624,7 @@ def resolve_env(host, env_name):
 
 
 def verify_shared_asset(binding):
-    base = Path(binding["path"])
+    base = Path(expand_remote_path(binding["path"], "shared path"))
     if not base.exists():
         raise ValueError(f"Shared asset {binding['name']!r} missing on remote host: {base}")
     target = (base / binding["manifest"]) if binding["manifest"] else base
@@ -416,7 +633,7 @@ def verify_shared_asset(binding):
             raise ValueError(f"Shared asset {binding['name']!r} expected file for sha256 check: {target}")
         with target.open("rb") as f:
             digest = hashlib.file_digest(f, "sha256").hexdigest()
-        if digest != binding["sha256"]:
+        if digest != binding["sha256"].lower():
             raise ValueError(
                 f"Shared asset {binding['name']!r} sha256 mismatch at {target}: "
                 f"got {digest}, expected {binding['sha256']}"
@@ -566,9 +783,10 @@ def state_of(job, root, *, persist=True):
     state = read_json(state_path)
     if not isinstance(state, dict):
         raise ValueError(f"Corrupt run metadata for {job.name}")
+    t_session = session_name(root, job.name)
     if state["status"] not in TERMINAL:
         has_tmux = subprocess.run(
-            ["tmux", "has-session", "-t", "=" + session_name(root, job.name)], capture_output=True
+            ["tmux", "has-session", "-t", "=" + t_session], capture_output=True
         ).returncode == 0
         if not has_tmux:
             state = read_json(state_path)
@@ -597,10 +815,26 @@ def state_of(job, root, *, persist=True):
         "workdir": req["workdir"],
         "shared_dir": req.get("shared_dir", ""),
         "session": req.get("session", ""),
+        "tmux_session": t_session,
         "command": req.get("command", []),
         "shell": req.get("shell", ""),
         "elapsed_sec": elapsed,
     }
+
+
+def wait_job_terminal(job, root, wait_sec, *, include_log=True, offset=None, tail_bytes=8192, raw_log=False, wake_on_output=False):
+    deadline = time.monotonic() + wait_sec
+    log_path = job / "run.log"
+    state = state_of(job, root)
+    while state["status"] not in TERMINAL and time.monotonic() < deadline:
+        if wake_on_output and offset is not None and log_path.is_file() and log_path.stat().st_size > offset:
+            break
+        interval = 0.15 if wake_on_output else 0.5
+        time.sleep(min(interval, max(0.05, deadline - time.monotonic())))
+        state = state_of(job, root)
+    if include_log:
+        state["log"] = read_log_slice(log_path, offset=offset, tail_bytes=tail_bytes, raw_log=raw_log)
+    return state
 
 
 def ssh_call(host, action, data, timeout=60):
@@ -608,7 +842,7 @@ def ssh_call(host, action, data, timeout=60):
     payload = {"action": action, "host": host, "script": source, **data}
     boot = "import json,sys;p=json.load(sys.stdin);exec(compile(p['script'],'remote_run.py','exec'),{'PAYLOAD':p})"
     cmd = shlex.join(["python3", "-B", "-c", boot])
-    out = run([*SSH, host["ssh"], cmd], stdin=json.dumps(payload), timeout=timeout)
+    out = run([*build_ssh_argv(host), host["ssh"], cmd], stdin=json.dumps(payload), timeout=timeout)
     return json.loads(out)
 
 
@@ -618,9 +852,13 @@ def active_runs_for_workdir(root, workdir, *, persist=True):
         return []
     active = []
     for child in runs_dir.iterdir():
-        if not child.is_dir() or not (child / "state.json").is_file() or not (child / "request.json").is_file():
+        st_path = child / "state.json"
+        if not child.is_dir() or not st_path.is_file() or not (child / "request.json").is_file():
             continue
         try:
+            raw_st = read_json(st_path)
+            if not isinstance(raw_st, dict) or raw_st.get("status") in TERMINAL:
+                continue
             st = state_of(child, root, persist=persist)
         except (ValueError, KeyError, OSError):
             continue
@@ -629,18 +867,36 @@ def active_runs_for_workdir(root, workdir, *, persist=True):
     return active
 
 
+def read_synced_manifest_files(wdir):
+    mpath = wdir / SYNCED_MANIFEST
+    if not mpath.is_file():
+        return []
+    try:
+        data = read_json(mpath)
+        files = data.get("files", []) if isinstance(data, dict) else []
+        if not isinstance(files, list):
+            return []
+        return [x for x in files if isinstance(x, str)]
+    except (ValueError, OSError):
+        return []
+
+
 def prepare_remote_workspace(root, ws_info, share_project, *, check_run_id="", adopt=False, dry_run=False, for_sync=True):
     ensure_root_owned(root, dry_run=dry_run)
-    wdir = Path(remote_path(ws_info["workdir"], "workdir"))
+    wdir = Path(expand_remote_path(ws_info["workdir"], "workdir"))
     validate_remote_workdir(root, wdir)
+    sdir_raw = expand_remote_path(ws_info["shared_dir"], "shared_dir") if ws_info.get("shared_dir") else ""
     run_exists = bool(check_run_id and (root / "runs" / identifier(check_run_id, "run_id")).exists())
     if run_exists:
         return {
+            "root": str(root),
             "workdir": str(wdir),
+            "shared_dir": sdir_raw,
             "shared_mounted": list(share_project),
             "run_exists": True,
             "workspace_exists": wdir.is_dir(),
             "active_runs_warning": [],
+            "prev_synced_files": [],
         }
 
     managed = bool(ws_info.get("managed", True))
@@ -691,9 +947,9 @@ def prepare_remote_workspace(root, ws_info, share_project, *, check_run_id="", a
             write_json(marker, {"schema_version": 1, "created_at": now(), **expected})
 
     if share_project:
-        if not ws_info.get("shared_dir"):
+        if not sdir_raw:
             raise ValueError("Cannot mount project shared directories without a managed shared_dir")
-        sdir = Path(remote_path(ws_info["shared_dir"], "shared_dir"))
+        sdir = Path(sdir_raw)
         if not dry_run:
             sdir.mkdir(parents=True, exist_ok=True)
         for name in share_project:
@@ -728,21 +984,93 @@ def prepare_remote_workspace(root, ws_info, share_project, *, check_run_id="", a
                     raise ValueError(f"Cannot mount shared dir {rel!r}: file exists at {link_path}")
             else:
                 link_path.symlink_to(target_path)
+    prev_synced = read_synced_manifest_files(wdir) if (for_sync and wdir.is_dir()) else []
     return {
+        "root": str(root),
         "workdir": str(wdir),
+        "shared_dir": sdir_raw,
         "shared_mounted": list(share_project),
         "run_exists": False,
         "workspace_exists": wdir.is_dir(),
         "active_runs_warning": active_runs_for_workdir(root, str(wdir), persist=not dry_run),
+        "prev_synced_files": prev_synced,
     }
+
+
+def reconcile_synced_manifest(root, workdir_raw, current_files, prune_candidates, protected_prefixes):
+    wdir = Path(expand_remote_path(workdir_raw, "workdir"))
+    validate_remote_workdir(root, wdir)
+    if not (wdir / WORKSPACE_MARKER).is_file():
+        return {"pruned_ghost_files": []}
+    wres = wdir.resolve()
+    on_disk_prev = set(read_synced_manifest_files(wdir))
+    clean_current = []
+    seen_curr = set()
+    for raw in current_files:
+        norm = rel_path(raw, "synced file")
+        if norm not in seen_curr:
+            seen_curr.add(norm)
+            clean_current.append(norm)
+    prot = {p.strip("/") for p in protected_prefixes if isinstance(p, str) and p.strip("/")}
+    markers = {ROOT_MARKER, WORKSPACE_MARKER, SYNCED_MANIFEST}
+
+    pruned = []
+    for raw in sorted(set(prune_candidates) & on_disk_prev - seen_curr):
+        try:
+            rel = rel_path(raw, "stale file")
+        except ValueError:
+            continue
+        if rel in markers:
+            continue
+        if any(rel == p or rel.startswith(p + "/") for p in prot):
+            continue
+        target = wdir / rel
+        if target.is_symlink() or not target.exists() or not target.is_file():
+            continue
+        try:
+            if not target.resolve().is_relative_to(wres):
+                continue
+            target.unlink()
+            pruned.append(rel)
+            parent = target.parent
+            while parent != wdir and wres in parent.parents:
+                if parent.is_symlink() or any(parent.iterdir()):
+                    break
+                parent.rmdir()
+                parent = parent.parent
+        except OSError:
+            continue
+
+    write_json(wdir / SYNCED_MANIFEST, {
+        "schema_version": 1,
+        "updated_at": now(),
+        "files": sorted(clean_current),
+    })
+    return {"pruned_ghost_files": pruned}
 
 
 def normalize_request(root, request):
     req = dict(request)
+    req["locks_dir"] = expand_remote_path(req["locks_dir"], "locks_dir")
+    if req.get("shared_dir"):
+        req["shared_dir"] = expand_remote_path(req["shared_dir"], "shared_dir")
+    if req.get("python"):
+        req["python"] = expand_remote_path(req["python"], "python")
+    if req.get("path_prepend"):
+        req["path_prepend"] = [expand_remote_path(p, "path_prepend") for p in req["path_prepend"]]
+    if req.get("shared"):
+        expanded_shared = {}
+        for alias, binding in req["shared"].items():
+            bcopy = dict(binding)
+            bcopy["path"] = expand_remote_path(bcopy["path"], "shared path")
+            expanded_shared[alias] = bcopy
+        req["shared"] = expanded_shared
+    expanded_wdir = expand_remote_path(req["workdir"], "workdir")
     if req.pop("fallback_root", False):
-        candidate = Path(remote_path(req["workdir"], "workdir"))
-        if not candidate.is_dir():
-            req["workdir"] = str(root)
+        candidate = Path(expanded_wdir)
+        req["workdir"] = expanded_wdir if candidate.is_dir() else str(root)
+    else:
+        req["workdir"] = expanded_wdir
     return req
 
 
@@ -757,7 +1085,14 @@ def remote_submit(root, job, host, request, worker_src):
     if req_to_save["python"] and not Path(req_to_save["python"]).is_file():
         raise ValueError(f"Configured Python does not exist on host: {req_to_save['python']}")
     workdir = Path(remote_path(req_to_save["workdir"], "workdir"))
+    if workdir != root:
+        validate_remote_workdir(root, workdir)
+    else:
+        validate_remote_root(root)
     workdir.mkdir(parents=True, exist_ok=True)
+    runs_dir = root / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(runs_dir, 0o700)
     job.mkdir(parents=True)
     (job / "artifacts").mkdir()
     write_json(job / "request.json", req_to_save)
@@ -918,6 +1253,8 @@ def prune_runs(root, host, days, apply_del):
     skipped_unmanaged = []
     reclaimed_bytes = 0
     if runs_dir.is_dir():
+        tsess_proc = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
+        live_sessions = set(tsess_proc.stdout.splitlines()) if (tsess_proc.returncode == 0 and isinstance(tsess_proc.stdout, str)) else set()
         for child in sorted(runs_dir.iterdir()):
             if child.is_symlink() or not child.is_dir():
                 skipped_unmanaged.append({"path": str(child), "reason": "symlink_or_non_dir"})
@@ -926,10 +1263,7 @@ def prune_runs(root, host, days, apply_del):
             if not (req_p.is_file() or st_p.is_file()):
                 skipped_unmanaged.append({"path": str(child), "reason": "missing_metadata"})
                 continue
-            has_tmux = subprocess.run(
-                ["tmux", "has-session", "-t", "=" + session_name(root, child.name)], capture_output=True
-            ).returncode == 0
-            if has_tmux:
+            if session_name(root, child.name) in live_sessions:
                 continue
             raw_st = {}
             raw_req = {}
@@ -955,13 +1289,18 @@ def prune_runs(root, host, days, apply_del):
             mtime = child.stat().st_mtime
             if mtime > cutoff:
                 continue
-            try:
-                st = state_of(child, root, persist=False)
-                status_label = st["status"]
-                if status_label not in TERMINAL:
+            if raw_st.get("status") in TERMINAL:
+                status_label = raw_st["status"]
+            else:
+                if (time.time() - mtime) < 5.0:
                     continue
-            except (ValueError, KeyError, OSError):
-                status_label = "corrupt"
+                try:
+                    st = state_of(child, root, persist=False)
+                    status_label = st["status"]
+                    if status_label not in TERMINAL:
+                        continue
+                except (ValueError, KeyError, OSError):
+                    status_label = "corrupt"
             sz = dir_size_bytes(child)
             pruned.append({"run_id": child.name, "status": status_label, "bytes": sz})
             reclaimed_bytes += sz
@@ -972,7 +1311,7 @@ def prune_runs(root, host, days, apply_del):
     if proj_dir.is_dir():
         for ws in sorted(proj_dir.glob("*/workspaces/*")):
             if ws.is_dir() and not ws.is_symlink():
-                workspaces.append({"path": str(ws), "bytes": dir_size_bytes(ws)})
+                workspaces.append({"path": str(ws)})
     return {
         "host": host["name"], "days": days, "applied": apply_del,
         "runs_count": len(pruned), "reclaimed_bytes": reclaimed_bytes,
@@ -980,13 +1319,47 @@ def prune_runs(root, host, days, apply_del):
     }
 
 
+# === 5. Remote Control Plane & CLI Interface ===
+
 def control(payload):
     host, action = payload["host"], payload["action"]
-    root = Path(remote_path(host["root"], "root"))
-    locks_dir = Path(remote_path(host["locks_dir"], "locks_dir"))
+    host_pp = list(host.get("path_prepend", []))
+    os.environ["PATH"] = build_remote_path(os.environ.get("PATH", ""), host_pp)
+    root = Path(expand_remote_path(host["root"], "root"))
+    locks_dir = Path(expand_remote_path(host.get("locks_dir") or join_remote_path(host["root"], "locks"), "locks_dir"))
+
+    if action == "probe_init":
+        validate_remote_root(root)
+        tools = {t: shutil.which(t) for t in ("bash", "tmux", "rsync")}
+        missing_tools = [t for t, found in tools.items() if not found]
+        gpus = []
+        device = "cpu"
+        if shutil.which("nvidia-smi"):
+            try:
+                gpu_out = run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"])
+                gpus = parse_gpus(gpu_out)
+                if any("index" in g for g in gpus):
+                    device = "cuda:0"
+            except (RuntimeError, OSError):
+                gpus = []
+        home = Path.home()
+        existing_tool_dirs = [
+            f"~/{p.relative_to(home).as_posix()}" if p.is_relative_to(home) else str(p)
+            for p in (home / ".local" / "bin", home / ".cargo" / "bin", home / "go" / "bin")
+            if p.is_dir()
+        ]
+        return {
+            "status": "ok",
+            "tools": tools,
+            "missing_tools": missing_tools,
+            "device": device,
+            "gpus": gpus,
+            "resolved_root": str(root),
+            "existing_tool_dirs": existing_tool_dirs,
+        }
 
     if action == "doctor":
-        missing = [t for t in ("git", "tmux", "rsync") if not shutil.which(t)]
+        missing = [t for t in ("bash", "tmux", "rsync") if not shutil.which(t)]
         if missing:
             raise ValueError(f"Compute host missing required tool(s): {', '.join(missing)}")
         ensure_root_owned(root, init_root=bool(payload.get("init_root", False)))
@@ -1004,9 +1377,32 @@ def control(payload):
                 raise ValueError("Host configured for CUDA but 'nvidia-smi' not found")
             gpus = run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"])
             info["gpus"] = parse_gpus(gpus)
+
+        check_cmds = list(payload.get("check_cmds", []))
+        py = expand_remote_path(payload["python"], "python") if payload.get("python") else ""
+        venv_bin = None
+        if not py and payload.get("env_name") == "venv" and payload.get("workdir"):
+            cand_wdir = Path(expand_remote_path(payload["workdir"], "workdir"))
+            cand_vbin = cand_wdir / ".venv" / "bin"
+            if cand_vbin.is_dir():
+                venv_bin = cand_vbin
+                if (cand_vbin / "python").is_file():
+                    py = str(cand_vbin / "python")
+        if check_cmds:
+            cmd_path = build_remote_path(os.environ.get("PATH", ""), payload.get("path_prepend", []))
+            if venv_bin is not None:
+                cmd_path = str(venv_bin) + (os.pathsep + cmd_path if cmd_path else "")
+            elif py:
+                cmd_path = str(Path(py).parent) + (os.pathsep + cmd_path if cmd_path else "")
+            cmd_map = {}
+            for c in check_cmds:
+                command_name(c, "command")
+                cmd_map[c] = shutil.which(c, path=cmd_path)
+            info["commands"] = cmd_map
+            info["missing_commands"] = [c for c, resolved in cmd_map.items() if not resolved]
+
         check_imports = list(payload.get("check_imports", []))
         check_cuda = bool(payload.get("check_cuda", False))
-        py = payload.get("python", "")
         if (check_imports or check_cuda) and not py:
             raise ValueError(
                 f"Cannot run --check-import/--check-cuda with env {info['env']!r} (no host Python configured); "
@@ -1046,9 +1442,12 @@ def control(payload):
                 info["missing_imports"] = [m for m in check_imports if not probe["imports"].get(m)]
                 if check_cuda:
                     info["cuda_probe"] = probe["cuda_probe"]
-                if info["missing_imports"]:
-                    info["status"] = "missing_imports"
-                    info["_exec_failed"] = True
+        if info.get("missing_commands") or info.get("missing_imports"):
+            info["status"] = (
+                "missing_imports" if (info.get("missing_imports") and not info.get("missing_commands"))
+                else ("missing_commands" if (info.get("missing_commands") and not info.get("missing_imports")) else "missing_checks")
+            )
+            info["_exec_failed"] = True
         verified_shared = {}
         for alias, binding in payload.get("shared", {}).items():
             verified_shared[alias] = verify_shared_asset(binding)
@@ -1072,9 +1471,13 @@ def control(payload):
     locks_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(locks_dir, 0o700)
 
+    if action == "prune":
+        return prune_runs(root, host, float(payload.get("days", 14.0)), bool(payload.get("apply", False)))
+
     if action == "session":
         sdir = root / "sessions"
         sub = payload["subaction"]
+        wdir_filter = expand_remote_path(payload["workdir"], "workdir") if payload.get("workdir") else ""
         if sub == "list":
             items = []
             if sdir.is_dir():
@@ -1086,12 +1489,12 @@ def control(payload):
                     except (ValueError, KeyError, OSError) as exc:
                         items.append({"session_key": p.stem, "status": "corrupt", "error": str(exc)})
                         continue
-                    if payload.get("workdir") and data.get("workdir") != payload["workdir"]:
+                    if wdir_filter and data.get("workdir") != wdir_filter:
                         continue
                     items.append({"session_key": p.stem, **data})
             return {"sessions": items}
         if sub == "reset":
-            key = session_key_for(payload["workdir"], payload["name"])
+            key = session_key_for(wdir_filter, payload["name"])
             sdir.mkdir(parents=True, exist_ok=True)
             os.chmod(sdir, 0o700)
             with (sdir / f"{key}.lock").open("a") as slock:
@@ -1099,7 +1502,7 @@ def control(payload):
                 target = sdir / f"{key}.json"
                 existed = target.is_file()
                 target.unlink(missing_ok=True)
-            return {"reset": True, "name": payload["name"], "existed": existed, "workdir": payload["workdir"]}
+            return {"reset": True, "name": payload["name"], "existed": existed, "workdir": wdir_filter}
         raise ValueError(f"Unknown session subaction: {sub}")
 
     if action == "status":
@@ -1107,19 +1510,33 @@ def control(payload):
         if not math.isfinite(wait_sec) or wait_sec < 0:
             raise ValueError("wait_sec must be a finite non-negative number")
         job = root / "runs" / identifier(payload["run_id"], "run_id")
-        deadline = time.monotonic() + wait_sec
-        state = state_of(job, root)
-        while state["status"] not in TERMINAL and time.monotonic() < deadline:
-            time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
-            state = state_of(job, root)
-        if payload.get("include_log", True):
-            state["log"] = read_log_slice(
-                job / "run.log",
-                offset=payload.get("offset"),
+        return wait_job_terminal(
+            job, root, wait_sec,
+            include_log=payload.get("include_log", True),
+            offset=payload.get("offset"),
+            tail_bytes=payload.get("tail_bytes", 8192),
+            raw_log=payload.get("raw_log", False),
+            wake_on_output=bool(payload.get("wake_on_output", False)),
+        )
+
+    if action == "submit":
+        wait_sec = float(payload.get("wait_sec", 0.0))
+        if not math.isfinite(wait_sec) or wait_sec < 0:
+            raise ValueError("wait_sec must be a finite non-negative number")
+        job = root / "runs" / identifier(payload["run_id"], "run_id")
+        with (root / "submit.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            receipt = remote_submit(root, job, host, payload["request"], payload["script"])
+        if wait_sec > 0:
+            st = wait_job_terminal(
+                job, root, wait_sec,
+                include_log=True,
                 tail_bytes=payload.get("tail_bytes", 8192),
                 raw_log=payload.get("raw_log", False),
             )
-        return state
+            st["reused"] = receipt.get("reused", False)
+            return st
+        return receipt
 
     with (root / "submit.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1129,6 +1546,14 @@ def control(payload):
                 check_run_id=payload.get("run_id", ""),
                 adopt=bool(payload.get("adopt", False)),
                 for_sync=bool(payload.get("for_sync", True)),
+            )
+        if action == "reconcile_synced":
+            return reconcile_synced_manifest(
+                root,
+                payload["workdir"],
+                payload.get("current_files", []),
+                payload.get("prune_candidates", []),
+                payload.get("protected_prefixes", []),
             )
         if action == "list":
             runs_dir = root / "runs"
@@ -1154,11 +1579,7 @@ def control(payload):
                         break
             items.sort(key=lambda r: r.get("submitted_at", ""), reverse=True)
             return {"runs": items[:limit]}
-        if action == "prune":
-            return prune_runs(root, host, float(payload.get("days", 14.0)), bool(payload.get("apply", False)))
         job = root / "runs" / identifier(payload["run_id"], "run_id")
-        if action == "submit":
-            return remote_submit(root, job, host, payload["request"], payload["script"])
         if action == "cancel":
             return remote_cancel(root, job)
         state = state_of(job, root)
@@ -1173,7 +1594,8 @@ def control(payload):
                 paths_only=bool(payload.get("paths_only", False)),
             )
             return {
-                "status": state["status"], "job_files": job_files, "workdir_files": workdir_files,
+                "status": state["status"], "root": str(root),
+                "job_files": job_files, "workdir_files": workdir_files,
                 "workdir": state["workdir"], "skipped_artifacts": skipped,
             }
         raise ValueError(f"Unknown action: {action}")
@@ -1248,10 +1670,17 @@ def worker(root, job):
     state = read_json(state_path)
     state["worker_pid"] = os.getpid()
     write_json(state_path, state)
-    locks_dir = Path(remote_path(request["locks_dir"], "locks_dir"))
-    locks_dir.mkdir(parents=True, exist_ok=True)
-    use_lock = request["device"].startswith("cuda") and request.get("use_gpu", True) and request.get("gpu_slot")
-    lease = (locks_dir / f"{request['gpu_slot']}.lock").open("a") if use_lock else nullcontext()
+    locks_dir = Path(expand_remote_path(request["locks_dir"], "locks_dir"))
+    req_device = validate_device(request["device"], "device")
+    use_gpu = bool(request.get("use_gpu", True)) and req_device.startswith("cuda")
+    if "gpu_slots" in request:
+        slots = list(request.get("gpu_slots") or [])
+    else:
+        slots = [request["gpu_slot"]] if request.get("gpu_slot") else []
+    gpu_slots = sorted({identifier(s, "gpu_slot") for s in slots if s}, key=slot_sort_key) if use_gpu else []
+    if gpu_slots:
+        locks_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(locks_dir, 0o700)
     proc = None
 
     def forward_sig(signum, _frame):
@@ -1267,11 +1696,12 @@ def worker(root, job):
     signal.signal(signal.SIGHUP, forward_sig)
 
     try:
-        if use_lock:
+        if gpu_slots:
             state.update(waiting_for_lock=True)
             write_json(state_path, state)
-        with lease as handle:
-            if handle is not None:
+        with ExitStack() as stack:
+            for slot in gpu_slots:
+                handle = stack.enter_context((locks_dir / f"{slot}.lock").open("a"))
                 fcntl.flock(handle, fcntl.LOCK_EX)
             if (job / "cancel.request").exists():
                 state.update(waiting_for_lock=False, status="cancelled")
@@ -1282,7 +1712,7 @@ def worker(root, job):
 
             shared_paths = {alias: verify_shared_asset(binding) for alias, binding in request["shared"].items()}
 
-            workdir = Path(request["workdir"])
+            workdir = Path(expand_remote_path(request["workdir"], "workdir"))
             default_cwd = str(workdir / request["rel_subdir"]) if (
                 request.get("rel_subdir") and (workdir / request["rel_subdir"]).is_dir()
             ) else str(workdir)
@@ -1291,8 +1721,8 @@ def worker(root, job):
 
             env = dict(os.environ)
             env.update(request.get("env_static", {}))
-            prepend = list(request.get("path_prepend", []))
-            effective_python = request["python"]
+            prepend = [expand_remote_path(p, "path_prepend") for p in request.get("path_prepend", [])]
+            effective_python = expand_remote_path(request["python"], "python") if request.get("python") else ""
             if request.get("auto_venv"):
                 vbin = workdir / ".venv" / "bin"
                 if vbin.is_dir():
@@ -1303,22 +1733,25 @@ def worker(root, job):
                         effective_python = str(vpy)
             elif effective_python:
                 prepend.insert(0, str(Path(effective_python).parent))
-            if prepend:
-                env["PATH"] = os.pathsep.join(prepend + ([env["PATH"]] if env.get("PATH") else []))
+            env["PATH"] = build_remote_path(env.get("PATH", ""), prepend)
 
             user_cvd = "CUDA_VISIBLE_DEVICES" in request.get("env_static", {}) or "CUDA_VISIBLE_DEVICES" in request.get("env_vars", {})
-            exposed_device = request["device"]
-            if request["device"] == "cpu" or not request.get("use_gpu", True):
-                if not user_cvd:
-                    env["CUDA_VISIBLE_DEVICES"] = ""
+            if req_device.startswith("cuda"):
+                if not use_gpu:
+                    if not user_cvd:
+                        env["CUDA_VISIBLE_DEVICES"] = ""
+                    exposed_device = "cpu"
+                else:
+                    idx_part = req_device.partition(":")[2] or "0"
+                    idx_list = idx_part.split(",")
+                    if not user_cvd:
+                        env["CUDA_VISIBLE_DEVICES"] = ",".join(idx_list)
+                    exposed_device = "cuda:0" if len(idx_list) == 1 else "cuda:" + ",".join(str(i) for i in range(len(idx_list)))
+                env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            else:
                 exposed_device = "cpu"
-            elif request["device"].startswith("cuda") and not user_cvd:
-                idx = request["device"].partition(":")[2] or "0"
-                env["CUDA_VISIBLE_DEVICES"] = idx
-                exposed_device = "cuda:0"
 
             env.setdefault("PYTHONUNBUFFERED", "1")
-            env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             env.update(session_env)
 
             git_commit = request.get("git_commit", "")
@@ -1417,9 +1850,9 @@ def worker(root, job):
         write_json(state_path, state)
 
 
-def build_rsync_filters(proj_cfg, ws_info):
+def build_rsync_filters(proj_cfg, _ws_info):
     filters = []
-    for marker in (ROOT_MARKER, WORKSPACE_MARKER):
+    for marker in (ROOT_MARKER, WORKSPACE_MARKER, SYNCED_MANIFEST):
         filters.extend(["--filter", f"P /{marker}", "--filter", f"- /{marker}"])
     protected = list(BUILTIN_PRESERVE) + proj_cfg["sync"]["preserve"] + proj_cfg["share"]["project"]
     seen_p = set()
@@ -1457,12 +1890,33 @@ def parse_rsync_itemize(stdout):
     return would_update, would_delete
 
 
+def list_local_sync_files(repo_root, filters):
+    with tempfile.TemporaryDirectory() as empty_dst:
+        cmd = [
+            "rsync", "-rlpt", "-ni", "--itemize-changes", *rsync_protect_args(),
+            *filters, f"{repo_root.resolve()}/", f"{empty_dst}/",
+        ]
+        out = run(cmd, timeout=120)
+    files = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        code, rel = parts
+        if len(code) >= 2 and code[0] in ("<", ">", "c", "h") and code[1] == "f":
+            files.append(rel)
+    return sorted(set(files))
+
+
 def sync_workspace(repo_root, proj_cfg, host, ws_info, *, run_id="", delete=False, dry_run=False, adopt=False):
     if adopt and delete:
         raise ValueError("Cannot combine --adopt and --delete; run --adopt first, then inspect with --dry-run --delete")
-    lock_dir = Path(tempfile.gettempdir()) / "remote-run-sync-locks"
+    lock_dir = Path.home() / ".cache" / "remote-run" / "sync-locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_dir / (sha256(f"{host['ssh']}:{ws_info['workdir']}".encode()).hexdigest()[:20] + ".lock")
+    os.chmod(lock_dir, 0o700)
+    lock_file = lock_dir / (sha256(f"{host['ssh']}:{host.get('port') or ''}:{ws_info['workdir']}".encode()).hexdigest()[:20] + ".lock")
     with lock_file.open("a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         prep = ssh_call(host, "prepare_workspace", {
@@ -1473,37 +1927,67 @@ def sync_workspace(repo_root, proj_cfg, host, ws_info, *, run_id="", delete=Fals
             "dry_run": dry_run,
         })
         if prep.get("run_exists"):
-            return {"host": host["name"], "workdir": ws_info["workdir"], "skipped_for_existing_run": True,
+            return {"host": host["name"], "workdir": prep["workdir"], "skipped_for_existing_run": True,
                     "project_id": ws_info["project_id"], "workspace_id": ws_info["workspace_id"]}
+        remote_workdir = prep["workdir"]
         filters = build_rsync_filters(proj_cfg, ws_info)
+        pargs = rsync_protect_args()
         if dry_run and not prep.get("workspace_exists", True):
             with tempfile.TemporaryDirectory() as empty_dst:
                 dry_cmd = [
                     "rsync", "-rlptz",
                     *(["--delete"] if delete else []),
-                    "-ni", "--itemize-changes", "--protect-args",
+                    "-ni", "--itemize-changes", *pargs,
                     *filters, f"{repo_root.resolve()}/", f"{empty_dst}/",
                 ]
                 out = run(dry_cmd, timeout=120)
         else:
-            dest = f"{host['ssh']}:{ws_info['workdir']}/"
-            rsync_cmd = ["rsync", "-rlptz", "--protect-args"]
+            dest = rsync_remote_spec(host["ssh"], remote_workdir)
+            rsync_cmd = ["rsync", "-rlptz", *pargs]
             if delete:
                 rsync_cmd.append("--delete")
             if dry_run:
                 rsync_cmd.extend(["-ni", "--itemize-changes"])
-            rsync_cmd.extend(["-e", shlex.join(SSH), *filters, f"{repo_root.resolve()}/", dest])
+            rsync_cmd.extend(["-e", shlex.join(build_ssh_argv(host)), *filters, f"{repo_root.resolve()}/", dest])
             out = run(rsync_cmd, timeout=120)
         res = {
-            "host": host["name"], "workdir": ws_info["workdir"],
+            "host": host["name"], "workdir": remote_workdir,
             "project_id": ws_info["project_id"], "workspace_id": ws_info["workspace_id"],
             "delete": delete, "dry_run": dry_run,
             "active_runs_warning": prep.get("active_runs_warning", []),
         }
+        prev_synced = prep.get("prev_synced_files", [])
         if dry_run:
             upd, dele = parse_rsync_itemize(out)
             res["would_update"] = upd
             res["would_delete"] = dele
+            if prev_synced and not delete:
+                curr_set = set(list_local_sync_files(repo_root, filters))
+                would_prune = [
+                    rel for rel in prev_synced
+                    if rel not in curr_set and not (repo_root / rel).exists() and not (repo_root / rel).is_symlink()
+                ]
+                if would_prune:
+                    res["would_prune_ghost"] = sorted(would_prune)
+            return res
+
+        current_files = list_local_sync_files(repo_root, filters)
+        curr_set = set(current_files)
+        prune_candidates = (
+            [] if delete else [
+                rel for rel in prev_synced
+                if rel not in curr_set and not (repo_root / rel).exists() and not (repo_root / rel).is_symlink()
+            ]
+        )
+        protected_prefixes = sorted(set(BUILTIN_PRESERVE + proj_cfg["sync"]["preserve"] + proj_cfg["share"]["project"]))
+        rec = ssh_call(host, "reconcile_synced", {
+            "workdir": remote_workdir,
+            "current_files": current_files,
+            "prune_candidates": prune_candidates,
+            "protected_prefixes": protected_prefixes,
+        })
+        if rec.get("pruned_ghost_files"):
+            res["pruned_ghost_files"] = rec["pruned_ghost_files"]
         return res
 
 
@@ -1531,6 +2015,107 @@ def wait_for_status(host, run_id, wait_sec, *, offset=None, tail_bytes=8192, raw
     return res
 
 
+def follow_run(host, run_id, *, raw_log=False):
+    offset = 0
+    while True:
+        res = ssh_call(
+            host,
+            "status",
+            {
+                "run_id": run_id,
+                "include_log": True,
+                "offset": offset,
+                "tail_bytes": 65536,
+                "raw_log": raw_log,
+                "wait_sec": 20.0,
+                "wake_on_output": True,
+            },
+            timeout=50,
+        )
+        log_obj = res.get("log", {})
+        text = log_obj.get("text", "")
+        if text:
+            sys.stdout.write(text)
+            if not text.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+        offset = log_obj.get("next_offset", offset)
+        if res.get("status") in TERMINAL and not log_obj.get("truncated"):
+            res.pop("log", None)
+            res["log_bytes"] = log_obj.get("total_bytes")
+            res["detached"] = False
+            if res.get("status") in ("failed", "interrupted", "cancelled"):
+                res["_exec_failed"] = True
+            return res
+
+
+def handle_init(args, config_path):
+    target = ssh_target(args.target, "target")
+    port = args.port
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError("--port must be between 1 and 65535")
+    default_base = target.split("@", 1)[1] if "@" in target else target
+    host_name = identifier(args.name, "--name") if args.name else sanitize_id(default_base, "server")
+    root_cfg = remote_path(args.root, "--root") if args.root else DEFAULT_REMOTE_ROOT
+
+    existing_default = None
+    existing_hosts = {}
+    if config_path.exists():
+        existing_default, existing_hosts = load_hosts_config(config_path)
+        if host_name in existing_hosts and not args.force:
+            raise ValueError(f"Host {host_name!r} already exists in {config_path}; pass --force to update")
+
+    probe_host = {
+        "name": host_name,
+        "ssh": target,
+        "port": port,
+        "root": root_cfg,
+        "locks_dir": join_remote_path(root_cfg, "locks"),
+        "device": "cpu",
+        "path_prepend": [],
+    }
+    probe = ssh_call(probe_host, "probe_init", {"root": root_cfg}, timeout=30)
+    new_entry = {
+        "name": host_name,
+        "ssh": target,
+        "port": port,
+        "root": root_cfg,
+        "locks_dir": join_remote_path(root_cfg, "locks"),
+        "device": probe["device"],
+        "gpu_slot": ",".join(device_gpu_slots(probe["device"])),
+        "gpu_slots": device_gpu_slots(probe["device"]),
+        "default_env": "",
+        "path_prepend": [],
+        "envs": {},
+        "shared": {},
+    }
+    updated_hosts = dict(existing_hosts)
+    updated_hosts[host_name] = new_entry
+    chosen_default = host_name if (args.default or existing_default is None) else existing_default
+
+    created_parent = not config_path.parent.exists()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if created_parent or config_path.parent.resolve() == DEFAULT_CONFIG.parent.resolve():
+        os.chmod(config_path.parent, 0o700)
+    tmp = config_path.with_name(f".{config_path.name}.{uuid4().hex}.tmp")
+    tmp.write_text(render_hosts_toml(chosen_default, updated_hosts))
+    os.chmod(tmp, 0o600)
+    tmp.replace(config_path)
+    return {
+        "config_path": str(config_path),
+        "host": host_name,
+        "default_host": chosen_default,
+        "ssh": target,
+        "port": port,
+        "root": root_cfg,
+        "resolved_root": probe["resolved_root"],
+        "device": probe["device"],
+        "gpus": probe.get("gpus", []),
+        "tools": probe["tools"],
+        "missing_tools": probe["missing_tools"],
+    }
+
+
 def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
     if args.shell and args.command:
         raise ValueError("Use either --shell CMD or positional command after '--', not both")
@@ -1541,6 +2126,8 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         raise ValueError("Provide a command after '--' or pass --shell CMD")
     if not math.isfinite(args.wait) or args.wait < 0:
         raise ValueError("--wait must be a finite non-negative number of seconds")
+    if args.tail_bytes < 0:
+        raise ValueError("--tail-bytes must be non-negative")
 
     if getattr(args, "_no_project_mode", False):
         explicit_dir = args.remote_dir or proj_cfg["remote_dir"]
@@ -1552,7 +2139,7 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
                 "git_commit": "", "git_branch": "", "git_dirty": False,
             }
         elif args.session:
-            wdir = str(Path(host["root"]) / "projects" / "_adhoc" / "workspaces" / "default")
+            wdir = join_remote_path(host["root"], "projects", "_adhoc", "workspaces", "default")
             ws_info = {
                 "project_id": "_adhoc", "workspace_id": "default", "managed": True,
                 "workdir": wdir, "shared_dir": "", "rel_subdir": "",
@@ -1584,12 +2171,28 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         k, v = item.split("=", 1)
         env_vars[k] = v
 
+    eff_device = validate_device(args.device, "--device") if args.device else host["device"]
+    if args.no_gpu or eff_device == "cpu":
+        use_gpu = False
+        eff_slots = []
+        eff_slot_str = ""
+    else:
+        use_gpu = True
+        if args.device and args.device != host["device"]:
+            eff_slots = device_gpu_slots(eff_device)
+        else:
+            eff_slots = list(host.get("gpu_slots") or device_gpu_slots(eff_device, host.get("gpu_slot", "")))
+        eff_slot_str = ",".join(eff_slots)
+
     run_id = args.run_id or datetime.now(timezone.utc).strftime("rr-%Y%m%dT%H%M%S-") + uuid4().hex[:8]
     fallback_root = False
     active_warning = []
+    remote_workdir = ws_info["workdir"]
+    remote_shared_dir = ws_info["shared_dir"]
     if not args.no_sync:
         sync_res = sync_workspace(repo_root, proj_cfg, host, ws_info, run_id=run_id)
         active_warning = sync_res.get("active_runs_warning", [])
+        remote_workdir = sync_res.get("workdir", remote_workdir)
     elif args.session or args.remote_dir or not ws_info["managed"]:
         prep = ssh_call(host, "prepare_workspace", {
             "workspace": ws_info,
@@ -1598,19 +2201,22 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
             "for_sync": False,
         })
         active_warning = prep.get("active_runs_warning", [])
+        remote_workdir = prep.get("workdir", remote_workdir)
+        remote_shared_dir = prep.get("shared_dir", remote_shared_dir)
     else:
         fallback_root = True
 
     session_name_user = identifier(args.session, "session") if args.session else ""
-    session_key = session_key_for(ws_info["workdir"], session_name_user) if session_name_user else ""
+    session_key = session_key_for(remote_workdir, session_name_user) if session_name_user else ""
 
     request = {
         "host": host["name"],
-        "device": host["device"],
-        "physical_device": host["device"],
-        "gpu_slot": host["gpu_slot"],
+        "device": eff_device,
+        "physical_device": eff_device,
+        "gpu_slot": eff_slot_str,
+        "gpu_slots": eff_slots,
         "locks_dir": host["locks_dir"],
-        "use_gpu": not args.no_gpu,
+        "use_gpu": use_gpu,
         "env_name": env_cfg["name"],
         "python": env_cfg["python"],
         "auto_venv": env_cfg["auto_venv"],
@@ -1618,8 +2224,8 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         "env_static": env_cfg["env"],
         "env_vars": env_vars,
         "shared": shared_bindings,
-        "workdir": ws_info["workdir"],
-        "shared_dir": ws_info["shared_dir"],
+        "workdir": remote_workdir,
+        "shared_dir": remote_shared_dir,
         "rel_subdir": rel_subdir,
         "fallback_root": fallback_root,
         "project_id": ws_info["project_id"],
@@ -1632,8 +2238,25 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         "command": [] if args.shell else cmd,
         "shell": args.shell or "",
     }
-    receipt = ssh_call(host, "submit", {"run_id": run_id, "request": request})
+
+    if args.follow:
+        receipt = ssh_call(host, "submit", {"run_id": run_id, "request": request})
+        try:
+            out = follow_run(host, run_id, raw_log=args.raw_log)
+            out["reused"] = receipt.get("reused", False)
+            if active_warning:
+                out["active_runs_warning"] = active_warning
+            return out
+        except KeyboardInterrupt:
+            print(
+                f"\nremote-run: detached locally; run {run_id} continues in remote tmux "
+                f"(check `remote-run status {run_id}` or `remote-run cancel {run_id}`)",
+                file=sys.stderr,
+            )
+            raise SystemExit(130)
+
     if args.wait == 0:
+        receipt = ssh_call(host, "submit", {"run_id": run_id, "request": request})
         receipt["detached"] = receipt["status"] not in TERMINAL
         if receipt["detached"]:
             receipt["next_action"] = (
@@ -1644,8 +2267,24 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         if receipt.get("status") in ("failed", "interrupted", "cancelled"):
             receipt["_exec_failed"] = True
         return receipt
-    out = wait_for_status(host, run_id, args.wait, tail_bytes=args.tail_bytes, raw_log=args.raw_log)
-    out["reused"] = receipt.get("reused", False)
+
+    out = ssh_call(
+        host,
+        "submit",
+        {
+            "run_id": run_id,
+            "request": request,
+            "wait_sec": args.wait,
+            "tail_bytes": args.tail_bytes,
+            "raw_log": args.raw_log,
+        },
+        timeout=max(60, int(args.wait) + 30),
+    )
+    out["detached"] = out.get("status") not in TERMINAL
+    if out["detached"]:
+        out["next_action"] = (
+            f"Check progress with `remote-run status {run_id} --wait 30` or cancel with `remote-run cancel {run_id}`"
+        )
     if active_warning:
         out["active_runs_warning"] = active_warning
     if out.get("status") in ("failed", "interrupted", "cancelled"):
@@ -1672,21 +2311,24 @@ def handle_pull(args, host):
         "run_id": args.run_id, "all_artifacts": args.all_artifacts,
         "max_file_mb": args.max_file_mb, "paths": args.path, "paths_only": paths_only,
     })
+    remote_root = meta.get("root") or host["root"]
+    pargs = rsync_protect_args()
+    ssh_cmd = shlex.join(build_ssh_argv(host))
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".remote-run-pull-", dir=dest.parent) as stage:
         contents = Path(stage) / "contents"
         contents.mkdir()
         if meta["job_files"]:
             run([
-                "rsync", "-aR", "--protect-args", "--files-from=-", "--from0", "-e", shlex.join(SSH),
-                f"{host['ssh']}:{host['root']}/runs/{args.run_id}/", str(contents),
+                "rsync", "-aR", *pargs, "--files-from=-", "--from0", "-e", ssh_cmd,
+                rsync_remote_spec(host["ssh"], f"{remote_root}/runs/{args.run_id}"), str(contents),
             ], stdin="\0".join(meta["job_files"]), timeout=300)
         if meta["workdir_files"]:
             wdest = contents / "workspace"
             wdest.mkdir(parents=True, exist_ok=True)
             run([
-                "rsync", "-aRk", "--protect-args", "--files-from=-", "--from0", "-e", shlex.join(SSH),
-                f"{host['ssh']}:{meta['workdir']}/", str(wdest),
+                "rsync", "-aRk", *pargs, "--files-from=-", "--from0", "-e", ssh_cmd,
+                rsync_remote_spec(host["ssh"], meta["workdir"]), str(wdest),
             ], stdin="\0".join(meta["workdir_files"]), timeout=300)
         if dest.is_symlink():
             dest.unlink()
@@ -1717,24 +2359,33 @@ def cli():
     parser = argparse.ArgumentParser(prog="remote-run", description=__doc__, parents=[common])
     sub = parser.add_subparsers(dest="action", required=True)
 
-    sub.add_parser("hosts", parents=[common], help="List configured hosts, environments, and host-level shared assets")
+    sub.add_parser("hosts", parents=[common], help="List configured hosts, named environments, and host-level shared assets")
+
+    init_p = sub.add_parser("init", parents=[common], help="Probe an SSH target and add it to hosts.toml")
+    init_p.add_argument("target", help="SSH alias from ~/.ssh/config or user@host")
+    init_p.add_argument("--name", default="", help="Host profile name in hosts.toml (default: derived from target)")
+    init_p.add_argument("--port", type=int, default=None, help="Optional SSH port (1-65535)")
+    init_p.add_argument("--root", default="", help=f"Remote workspace/run root (default: {DEFAULT_REMOTE_ROOT})")
+    init_p.add_argument("--default", action="store_true", help="Set as default_host in hosts.toml")
+    init_p.add_argument("--force", action="store_true", help="Overwrite an existing host entry with the same name")
 
     cfg_p = sub.add_parser("config", parents=[common], help="Validate configs and print effective workspace/sync settings")
     cfg_p.add_argument("--repo", type=Path, default=Path.cwd(), help="Local project path (default: cwd, auto-normalized to git root)")
-    cfg_p.add_argument("--remote-dir", default="", help="Explicit absolute remote workspace path override")
+    cfg_p.add_argument("--remote-dir", default="", help="Explicit remote workspace path override")
     cfg_p.add_argument("--workspace", default="", help="Explicit remote workspace ID override")
 
-    doc_p = sub.add_parser("doctor", parents=[common], help="Verify SSH, git/tmux/rsync, GPU, Python env, and shared assets")
+    doc_p = sub.add_parser("doctor", parents=[common], help="Verify SSH, bash/tmux/rsync, GPU, environments, commands, and shared assets")
     doc_p.add_argument("--repo", type=Path, default=None, help="Local project path to infer host, env, and [share].host from .remote-run.toml")
     doc_p.add_argument("--env", default="", help="Environment name from host config (or 'venv' / 'none')")
     doc_p.add_argument("--shared", action="append", default=[], help="Host shared asset name to verify (repeatable)")
+    doc_p.add_argument("--check-cmd", action="append", default=[], help="Remote command/tool to check on PATH (repeatable, e.g. cargo, go, uv)")
     doc_p.add_argument("--check-import", action="append", default=[], help="Python module to test importing (repeatable)")
     doc_p.add_argument("--check-cuda", action="store_true", help="Probe torch.cuda.is_available() in the selected Python env")
     doc_p.add_argument("--init-root", action="store_true", help="Claim an existing non-empty remote root directory as owned by remote-run")
 
-    sync_p = sub.add_parser("sync", parents=[common], help="One-way additive sync from local repository to remote workspace")
+    sync_p = sub.add_parser("sync", parents=[common], help="One-way incremental sync from local repository to remote workspace")
     sync_p.add_argument("--repo", type=Path, default=Path.cwd(), help="Local project path (default: cwd, auto-normalized to git root)")
-    sync_p.add_argument("--remote-dir", default="", help="Explicit absolute remote workspace path override")
+    sync_p.add_argument("--remote-dir", default="", help="Explicit remote workspace path override")
     sync_p.add_argument("--workspace", default="", help="Explicit remote workspace ID override")
     sync_p.add_argument("--delete", action="store_true", help="Explicitly delete remote files absent locally (respects preserve protections)")
     sync_p.add_argument("--dry-run", action="store_true", help="Preview files that would be updated or deleted without modifying remote")
@@ -1742,26 +2393,29 @@ def cli():
 
     ex_p = sub.add_parser("exec", parents=[common], help="Sync (optional) and run command on remote host")
     ex_p.add_argument("--repo", type=Path, default=None, help="Local project path (default: cwd, auto-normalized to git root)")
-    ex_p.add_argument("--remote-dir", default="", help="Explicit absolute remote workspace path override")
+    ex_p.add_argument("--remote-dir", default="", help="Explicit remote workspace path override")
     ex_p.add_argument("--workspace", default="", help="Explicit remote workspace ID override")
     ex_p.add_argument("--no-sync", action="store_true", help="Skip rsync upload before executing")
     ex_p.add_argument("--no-project", action="store_true", help="Do not infer .remote-run.toml from --repo/cwd")
     ex_p.add_argument("--session", default="", help="Opt-in persistent shell session name (persists cwd and env diffs on rc=0)")
     ex_p.add_argument("--shell", default="", help="Run a compound bash command string (do not combine with positional command)")
     ex_p.add_argument("--wait", type=float, default=15.0, help="Seconds to wait before detaching to background (0=immediate, default: 15)")
-    ex_p.add_argument("--no-gpu", action="store_true", help="Skip GPU slot lock (useful for quick inspection like nvidia-smi)")
+    ex_p.add_argument("--follow", action="store_true", help="Stream remote output to stdout until completion (prints metadata JSON to stderr)")
+    ex_p.add_argument("--device", default="", help="Per-run device override: 'cpu' or 'cuda:N[,M...]' (acquires sorted slot locks)")
+    ex_p.add_argument("--no-gpu", action="store_true", help="Skip GPU slot locks and run without CUDA allocation")
     ex_p.add_argument("--env", default="", help="Host environment name, 'venv', or 'none'")
     ex_p.add_argument("--shared", action="append", default=[], help="Bind host shared asset as NAME or ALIAS=NAME (repeatable)")
     ex_p.add_argument("--env-var", action="append", default=[], help="Extra KEY=VALUE env var (supports {artifacts}/{shared.*}, repeatable)")
     ex_p.add_argument("--run-id", type=identifier, help="Explicit run ID for idempotent retries")
     ex_p.add_argument("--tail-bytes", type=int, default=8192, help="Max trailing log bytes to return (default: 8192)")
-    ex_p.add_argument("--raw-log", action="store_true", help="Return raw log bytes without collapsing tqdm carriage returns")
+    ex_p.add_argument("--raw-log", action="store_true", help="Return raw log bytes without collapsing carriage returns")
     ex_p.add_argument("--print-log", action="store_true", help="Print decoded log text to stdout and metadata JSON to stderr")
-    ex_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute after '--' (e.g. -- python train.py)")
+    ex_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute after '--' (e.g. -- cargo test)")
 
     st_p = sub.add_parser("status", parents=[common], help="Inspect a run status/log, or list recent runs")
     st_p.add_argument("run_id", nargs="?", type=identifier, help="Run ID to inspect (omit to list recent runs)")
     st_p.add_argument("--wait", type=float, default=0.0, help="Seconds to wait for terminal status (default: 0)")
+    st_p.add_argument("--follow", action="store_true", help="Stream live output until completion (prints metadata JSON to stderr)")
     st_p.add_argument("--offset", type=int, default=None, help="Byte offset to read log from")
     st_p.add_argument("--tail-bytes", type=int, default=8192, help="Max log bytes to return (default: 8192)")
     st_p.add_argument("--raw-log", action="store_true", help="Disable carriage-return folding")
@@ -1770,7 +2424,7 @@ def cli():
     st_p.add_argument("--project", default="", help="Filter listed runs by project_id")
     st_p.add_argument("--repo", type=Path, default=None, help="Filter listed runs to the project of this local repo")
 
-    ca_p = sub.add_parser("cancel", parents=[common], help="Cancel a queued or running job cleanly without leaking GPU VRAM")
+    ca_p = sub.add_parser("cancel", parents=[common], help="Cancel a queued or running job cleanly (kills process group and tmux session)")
     ca_p.add_argument("run_id", type=identifier, help="Run ID to cancel")
 
     pl_p = sub.add_parser("pull", parents=[common], help="Pull logs, metadata, and eligible artifacts to a local directory")
@@ -1806,6 +2460,9 @@ def cli():
     if args.action == "hosts":
         default_host, hosts = load_hosts_config(config_path)
         return {"default_host": default_host, "config_path": str(config_path), "hosts": hosts}, pretty, False
+
+    if args.action == "init":
+        return handle_init(args, config_path), pretty, False
 
     if args.action in ("config", "sync", "exec"):
         args._no_project_mode = False
@@ -1863,34 +2520,44 @@ def cli():
                 repo_root, proj_cfg, host, ws_info,
                 delete=args.delete, dry_run=args.dry_run, adopt=args.adopt,
             ), pretty, False
-        return handle_exec(args, host, repo_root, rel_subdir, proj_cfg), pretty, bool(args.print_log)
+        return handle_exec(args, host, repo_root, rel_subdir, proj_cfg), pretty, bool(args.print_log or args.follow)
 
     cwd_proj = infer_cwd_project_host()
     host = select_host(config_path, cli_host or (cwd_proj["host"] if cwd_proj else None) or None)
 
     if args.action == "doctor":
+        doc_workdir = ""
         if args.repo is not None:
-            rr_root, _, _ = resolve_repo_context(args.repo)
+            rr_root, r_sub, r_git = resolve_repo_context(args.repo)
             doc_proj = load_project_config(rr_root)
             host = select_host(config_path, cli_host or doc_proj["host"] or None)
             use_proj_defaults = True
         else:
             doc_proj = cwd_proj
             use_proj_defaults = bool(doc_proj and (not cli_host or not doc_proj["host"] or cli_host == doc_proj["host"]))
+            rr_root, r_sub, r_git = None, "", False
         env_name = args.env or (doc_proj["env"] if use_proj_defaults else "") or host["default_env"]
         env_cfg = resolve_env(host, env_name)
+        if env_cfg["auto_venv"] and rr_root is not None:
+            doc_workdir = resolve_workspace(rr_root, doc_proj, host, rel_subdir=r_sub, in_git=r_git)["workdir"]
         shared_specs = (list(doc_proj["share"]["host"]) if use_proj_defaults else []) + list(args.shared)
         shared = resolve_shared_bindings(host, shared_specs)
-        return ssh_call(host, "doctor", {
+        res = ssh_call(host, "doctor", {
             "env_name": env_cfg["name"],
             "python": env_cfg["python"],
+            "workdir": doc_workdir,
+            "path_prepend": env_cfg["path_prepend"],
+            "check_cmds": args.check_cmd,
             "check_imports": args.check_import,
             "check_cuda": args.check_cuda,
             "shared": shared,
             "init_root": args.init_root,
-        }), pretty, False
+        })
+        return res, pretty, False
     if args.action == "status":
         if not args.run_id:
+            if args.follow:
+                raise ValueError("--follow requires a RUN_ID")
             proj_filter = args.project
             if args.repo is not None:
                 rr_root, r_sub, r_git = resolve_repo_context(args.repo)
@@ -1899,6 +2566,15 @@ def cli():
                 if not proj_filter:
                     proj_filter = resolve_workspace(rr_root, pc, host, rel_subdir=r_sub, in_git=r_git)["project_id"]
             return ssh_call(host, "list", {"limit": args.limit, "project_id": proj_filter}), pretty, False
+        if args.follow:
+            try:
+                return follow_run(host, args.run_id, raw_log=args.raw_log), pretty, True
+            except KeyboardInterrupt:
+                print(
+                    f"\nremote-run: detached locally; check `remote-run status {args.run_id}` or cancel with `remote-run cancel {args.run_id}`",
+                    file=sys.stderr,
+                )
+                raise SystemExit(130)
         return wait_for_status(host, args.run_id, args.wait, offset=args.offset,
                                tail_bytes=args.tail_bytes, raw_log=args.raw_log), pretty, bool(args.print_log)
     if args.action == "cancel":
@@ -1952,6 +2628,8 @@ elif __name__ == "__main__":
                     print(log_obj["text"])
                 meta = {**out, "log_bytes": log_obj.get("total_bytes"), "truncated": log_obj.get("truncated")}
                 print(json.dumps(meta, ensure_ascii=False, indent=2 if pretty else None), file=sys.stderr)
+            elif print_log and isinstance(out, dict):
+                print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None), file=sys.stderr)
             else:
                 print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
             if exec_failed:

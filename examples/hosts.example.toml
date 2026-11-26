@@ -1,36 +1,55 @@
+# Global host configuration for remote-run (~/.config/remote-run/hosts.toml).
+# Level 0 (Minimum): only `ssh` is required; `root` defaults to "~/.local/share/remote-run"
+# and `device` defaults to "cpu" (lock-free concurrent execution, any language).
+# Tip: You can also generate this automatically via `remote-run init <ssh-alias-or-user@host>`.
+
 schema_version = 1
-default_host = "desktop"
+default_host = "server"
 
-[hosts.desktop]
-ssh = "linux_desktop"
-root = "/data/your-user/remote-run-jobs"
-# locks_dir = "/data/your-user/remote-run-locks"  # optional; defaults to <root>/locks
-device = "cuda:0"
-# gpu_slot = "gpu-0"                              # optional; defaults to gpu-0 for cuda:0
-default_env = "pytorch"
-# path_prepend = ["/home/your-user/.local/bin", "/home/your-user/.cargo/bin"]
+[hosts.server]
+ssh = "my-server"             # ~/.ssh/config alias or "user@host" (no ":port"; use port = ...)
 
-[hosts.desktop.envs.pytorch]
-python = "/data/your-user/envs/pytorch/bin/python"
-# [hosts.desktop.envs.pytorch.env]
+# ==============================================================================
+# Optional additions (uncomment only what your machine or workflow needs)
+# ==============================================================================
+
+# --- Level 1: Common connection, path, GPU, and toolchain options ---
+# port = 22                   # Optional SSH port (1-65535) if not in ~/.ssh/config
+# root = "/data/your-user/remote-run-jobs"   # Default: "~/.local/share/remote-run"
+# device = "cuda:0"           # Set for GPU hosts ("cuda:0" or "cuda:0,1") to enable slot locks + CUDA isolation
+# default_env = "venv"        # Named env below, or built-in "venv" / "none"
+# path_prepend = ["~/.local/bin", "~/.cargo/bin", "~/go/bin"]
+
+# --- Level 2a: Non-Python toolchain environment (no `python` key required) ---
+# [hosts.server.envs.rust]
+# path_prepend = ["~/.cargo/bin"]
+# [hosts.server.envs.rust.env]
+# CARGO_HOME = "/data/your-user/cargo-cache"
+
+# --- Level 2b: Python environment ---
+# [hosts.server.envs.pytorch]
+# python = "/data/your-user/envs/pytorch/bin/python"
+# [hosts.server.envs.pytorch.env]
 # HF_HOME = "/data/your-user/hf-cache"
 
-[hosts.desktop.envs.system]
-python = "/usr/bin/python3"
+# --- Level 2c: Custom resource lock directory or optional CPU-only alias ---
+# locks_dir = "/data/your-user/remote-run-locks"  # Optional; defaults to <root>/locks
+# gpu_slot = "gpu-0"                              # Optional; overrides auto-derived gpu-N slot(s)
+#
+# Most users only need `--no-gpu` or `--device cpu` on the same host profile rather than a duplicate block.
+# Define a separate CPU alias only if you want `host = "desktop_cpu"` pinned in a project's .remote-run.toml:
+# [hosts.desktop_cpu]
+# ssh = "my-server"
+# root = "/data/your-user/remote-run-jobs"
+# device = "cpu"
 
-# Recommended: CPU profile on the same machine so builds/tests skip GPU locks
-[hosts.desktop_cpu]
-ssh = "linux_desktop"
-root = "/data/your-user/remote-run-jobs"
-device = "cpu"
-default_env = "venv"
-# path_prepend = ["/home/your-user/.local/bin"]
-
-# Optional host-level shared assets (datasets, HF cache, pretrained weights).
-# [hosts.desktop.shared.hf-cache]
+# --- Level 2d: Host-level read-only shared assets (datasets, caches, pretrained weights) ---
+# Exposes REMOTE_RUN_SHARED_<ALIAS>_PATH / _VERSION / _SHA256 and {shared.<alias>.*} placeholders.
+# Does NOT create symlinks; verify path (and optional manifest SHA-256) with `remote-run doctor`.
+# [hosts.server.shared.hf-cache]
 # path = "/data/your-user/hf-cache"
 
-# [hosts.desktop.shared.pinned-dataset]
+# [hosts.server.shared.pinned-dataset]
 # path = "/data/your-user/datasets/v1"
 # manifest = "manifest.json"
 # sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

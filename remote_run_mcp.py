@@ -14,7 +14,7 @@ STDOUT_LOCK = threading.Lock()
 TOOLS = [
     {
         "name": "remote_hosts",
-        "description": "List configured remote compute hosts, devices, Python environments, and host-level shared assets.",
+        "description": "List configured remote compute hosts, devices, named environments (PATH, env vars, optional Python), and host-level shared assets.",
         "inputSchema": {
             "type": "object",
             "properties": {"config": {"type": "string", "description": "Optional path to hosts.toml"}},
@@ -41,7 +41,7 @@ TOOLS = [
     },
     {
         "name": "remote_doctor",
-        "description": "Check SSH connectivity, git/tmux/rsync, GPU availability, Python env, and shared assets on a host.",
+        "description": "Check SSH connectivity, bash/tmux/rsync, GPUs, commands on PATH, optional Python env, and shared assets on a host.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -49,6 +49,7 @@ TOOLS = [
                 "host": {"type": "string", "description": "Optional host name override"},
                 "env": {"type": "string", "description": "Environment name to probe (or 'venv' / 'none')"},
                 "shared": {"type": "array", "items": {"type": "string"}, "description": "Host shared asset names to verify"},
+                "check_cmds": {"type": "array", "items": {"type": "string"}, "description": "Commands/tools to check on remote PATH (e.g., cargo, go, node, uv)"},
                 "check_imports": {"type": "array", "items": {"type": "string"}, "description": "Python modules to test importing"},
                 "check_cuda": {"type": "boolean", "description": "Probe torch.cuda.is_available()"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
@@ -59,7 +60,7 @@ TOOLS = [
     },
     {
         "name": "remote_sync",
-        "description": "One-way additive rsync from local repository to its remote workspace (never deletes remote files).",
+        "description": "One-way incremental rsync from local repository to its remote workspace (safely prunes previously uploaded ghost files deleted locally; never deletes remote-owned files).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -77,7 +78,7 @@ TOOLS = [
     },
     {
         "name": "remote_exec",
-        "description": "Sync local code additively (unless no_sync=true) and run a command or shell snippet on a remote host; detaches cleanly if longer than wait.",
+        "description": "Sync local code incrementally (unless no_sync=true) and run a command or shell snippet on a remote host; detaches cleanly if longer than wait.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -90,7 +91,8 @@ TOOLS = [
                 "no_sync": {"type": "boolean", "description": "Skip rsync upload before executing"},
                 "session": {"type": "string", "description": "Opt-in persistent shell session name"},
                 "wait": {"type": "number", "description": "Seconds to wait before detaching (0=async, default 15)"},
-                "no_gpu": {"type": "boolean", "description": "Skip GPU slot lock for quick inspection"},
+                "device": {"type": "string", "description": "Per-run device override: 'cpu' or 'cuda:N[,M...]'"},
+                "no_gpu": {"type": "boolean", "description": "Skip GPU slot locks and run without CUDA allocation"},
                 "env": {"type": "string", "description": "Host environment name override, 'venv', or 'none'"},
                 "shared": {"type": "array", "items": {"type": "string"}, "description": "Bind host shared assets (NAME or ALIAS=NAME)"},
                 "env_vars": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra env vars (supports {artifacts}/{shared.*})"},
@@ -213,6 +215,22 @@ def run_cli(argv, *, timeout=120):
     return {"content": [{"type": "text", "text": msg}], "isError": True}
 
 
+def check_list(val, label):
+    if val is None:
+        return []
+    if not isinstance(val, list):
+        raise ValueError(f"{label} must be an array")
+    return [str(x) for x in val]
+
+
+def check_str_map(val, label):
+    if val is None:
+        return {}
+    if not isinstance(val, dict):
+        raise ValueError(f"{label} must be an object")
+    return val
+
+
 def common_flags(a):
     out = []
     if a.get("config") is not None:
@@ -243,10 +261,12 @@ def call_tool(name, a):
             argv.extend(["--repo", str(a["repo"])])
         if a.get("env") is not None:
             argv.extend(["--env", str(a["env"])])
-        for s in (a.get("shared") or []):
-            argv.extend(["--shared", str(s)])
-        for m in (a.get("check_imports") or []):
-            argv.extend(["--check-import", str(m)])
+        for s in check_list(a.get("shared"), "shared"):
+            argv.extend(["--shared", s])
+        for c in check_list(a.get("check_cmds"), "check_cmds"):
+            argv.extend(["--check-cmd", c])
+        for m in check_list(a.get("check_imports"), "check_imports"):
+            argv.extend(["--check-import", m])
         if a.get("check_cuda"):
             argv.append("--check-cuda")
         return run_cli(argv)
@@ -267,7 +287,8 @@ def call_tool(name, a):
         if a.get("no_sync") and not a.get("repo"):
             argv.append("--no-project")
         for k, flag in (("repo", "--repo"), ("remote_dir", "--remote-dir"), ("workspace", "--workspace"),
-                        ("session", "--session"), ("shell", "--shell"), ("env", "--env"), ("run_id", "--run-id")):
+                        ("session", "--session"), ("shell", "--shell"), ("device", "--device"),
+                        ("env", "--env"), ("run_id", "--run-id")):
             if a.get(k) is not None:
                 argv.extend([flag, str(a[k])])
         if a.get("no_sync"):
@@ -280,15 +301,18 @@ def call_tool(name, a):
             argv.extend(["--tail-bytes", str(int(a["tail_bytes"]))])
         if a.get("raw_log"):
             argv.append("--raw-log")
-        for s in (a.get("shared") or []):
-            argv.extend(["--shared", str(s)])
-        for k, v in (a.get("env_vars") or {}).items():
+        for s in check_list(a.get("shared"), "shared"):
+            argv.extend(["--shared", s])
+        for k, v in check_str_map(a.get("env_vars"), "env_vars").items():
             argv.extend(["--env-var", f"{k}={v}"])
-        if a.get("command"):
+        cmd_list = check_list(a.get("command"), "command")
+        if cmd_list:
             argv.append("--")
-            argv.extend(str(x) for x in a["command"])
+            argv.extend(cmd_list)
         wait_val = float(a["wait"]) if a.get("wait") is not None else 15.0
-        return run_cli(argv, timeout=max(90, int(wait_val) + 60))
+        base = 360 if not a.get("no_sync") else 90
+        extra = 180 if not a.get("no_sync") else 60
+        return run_cli(argv, timeout=max(base, int(wait_val) + extra))
     if name == "remote_status":
         argv = [*common_flags(a), "status"]
         if a.get("run_id") is not None:
@@ -321,8 +345,8 @@ def call_tool(name, a):
             argv.append("--all-artifacts")
         if a.get("max_file_mb") is not None:
             argv.extend(["--max-file-mb", str(float(a["max_file_mb"]))])
-        for p in (a.get("paths") or []):
-            argv.extend(["--path", str(p)])
+        for p in check_list(a.get("paths"), "paths"):
+            argv.extend(["--path", p])
         if a.get("paths_only"):
             argv.append("--paths-only")
         if a.get("force"):
@@ -366,7 +390,7 @@ def respond(msg_id, result=None, error=None):
 def handle_tool_call(msg_id, params):
     try:
         respond(msg_id, call_tool(params.get("name", ""), params.get("arguments", {})))
-    except (KeyError, TypeError, ValueError, OverflowError, OSError, subprocess.TimeoutExpired) as exc:
+    except Exception as exc:
         respond(msg_id, {"content": [{"type": "text", "text": f"Tool error: {exc}"}], "isError": True})
 
 
@@ -397,7 +421,7 @@ def main():
                 respond(msg_id, {
                     "protocolVersion": proto,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "remote-run", "version": "0.4.0"},
+                    "serverInfo": {"name": "remote-run", "version": "0.5.0"},
                 })
             elif method == "ping":
                 respond(msg_id, {})

@@ -1,80 +1,106 @@
 # remote-run Usage Guide
 
-`remote-run` lets you edit code and run AI CLI agents (`agy`, `Codex`, `Claude Code`) on a lightweight laptop while offloading compute (tests, builds, data scripts, GPU training) to a remote Linux host.
+`remote-run` keeps editing and AI agents (`agy`, Codex, Claude Code) on your local machine while transparently executing commands, builds, tests, and GPU workloads on any remote Linux host over SSH.
 
-## Core Design
+## Architecture Overview
 
-1. **Stateless default `exec` + opt-in `--session`**: Every `exec` runs inside an isolated remote `tmux` session and process group (`PGID`), auto-detaching into the background if it exceeds `--wait` (default `15`s). Pass `--session <name>` when you want `cwd` and environment diffs preserved across commands.
-2. **Additive-by-default one-way sync + ownership markers**: Code stays locally on your laptop and syncs additively from the repository root (`rsync -rlptz`, never deleting remote files unless you explicitly run `remote-run sync --delete`). Remote roots (`.remote-run-root.json`) and workspaces (`.remote-run-workspace.json`) verify ownership dynamically across any machine without hardcoded path denylists. Remote `.venv/`, `outputs/`, `checkpoints/`, `.cache/` (and `[sync].preserve` / `[share].project`) are neither uploaded from local nor deleted by `--delete`.
-3. **Strict 2-file config model**: Only `~/.config/remote-run/hosts.toml` and optional `<repo_root>/.remote-run.toml` exist. Unknown keys are rejected immediately.
+- **Connectivity, Config & Environments**: Built-in `0700` SSH `ControlMaster` multiplexing, optional `port`, `user@host`, `~/` remote paths, named environments (`PATH` + env vars + optional Python), and automatic discovery of existing standard remote tool dirs (`~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `/usr/local/go/bin`).
+- **Workspace, Sync & Data Flow**: 4-category sync model (see below), automatic single-checkout cache preservation vs. linked Git worktree isolation, ownership markers, and safe artifact retrieval.
+- **Execution, Sessions & Lifecycle**: Stateless isolated `tmux` + PGID execution per run, opt-in `--session <name>` persistence, real-time `--follow` streaming, `tmux_session` reporting, and whitelist-only `prune`.
+- **Optional Resource & Concurrency Aspect**: Lock-free concurrency by default (`device = "cpu"`). When a host declares `cuda`, sorted multi-slot `flock` locks (`--device cuda:0,1` locks `gpu-0` and `gpu-1` in order) and CUDA visibility isolation apply cleanly; `--no-gpu` skips locks and hides CUDA.
+
+---
 
 ## 1. Host Setup (`~/.config/remote-run/hosts.toml`)
 
 Remote Linux host requirements:
-- Batch-mode SSH alias (e.g., `linux_desktop`) with known host key (tip: enable SSH `ControlMaster auto` / `ControlPersist 60` in `~/.ssh/config` for faster edit-test loops)
-- `python3` (3.11+), `git`, `tmux`, `rsync`
+- Batch-mode SSH access (`ssh -o BatchMode=yes <alias-or-user@host> true`)
+- `python3` (3.11+), `bash`, `tmux`, `rsync` — **no remote `git` or `sudo` required**
 - For CUDA hosts: NVIDIA driver + `nvidia-smi`
 
-Copy [examples/hosts.example.toml](../examples/hosts.example.toml) to `~/.config/remote-run/hosts.toml` and verify:
+Quickest setup:
+
+```bash
+remote-run init my-server
+# Or with explicit user, port, and custom name:
+remote-run init ubuntu@192.168.1.50 --port 22345 --name lab --default
+```
+
+Or copy [examples/hosts.example.toml](../examples/hosts.example.toml) to `~/.config/remote-run/hosts.toml`, then verify:
 
 ```bash
 remote-run hosts
-remote-run doctor
-remote-run doctor --check-cuda --check-import torch
+remote-run doctor --check-cmd cargo --pretty
+remote-run doctor --repo . --check-cuda --check-import torch
 ```
 
-*(If pointing `hosts.toml` `root` at a pre-existing non-empty directory that already belongs to `remote-run`, run `remote-run doctor --init-root` once after verifying its path.)*
+*(If `root` points to an existing non-empty directory that belongs to `remote-run`, run `remote-run doctor --init-root` once after verifying its path.)*
 
-### Switching Machines, GPUs, and Environments
-- Pass `--host <name>` (before or after any subcommand), or set `host = "<name>"` in `.remote-run.toml`.
-- Define a CPU profile (`[hosts.desktop_cpu]` with `device = "cpu"`) alongside your GPU profile so tests/builds never block behind training runs.
-- Built-in `--env venv` automatically prepends `<remote_workspace>/.venv/bin` if present (ideal for `uv sync` / `python3 -m venv .venv`); built-in `--env none` runs without injecting any host Python.
-- For `device = "cuda:N"`, `CUDA_VISIBLE_DEVICES=N` is set automatically unless overridden.
+### Multi-GPU, CPU-Only Runs, and Named Environments
+- Use `--device <dev>` on `exec` to override the host default for one run (`--device cuda:1`, `--device cuda:0,1`, or `--device cpu`). Multi-GPU specs acquire per-card locks (`gpu-0`, `gpu-1`) in sorted order so `cuda:0,1` never collides with `cuda:0` and cannot deadlock.
+- Pass `--no-gpu` on `exec` to skip GPU locks and set `CUDA_VISIBLE_DEVICES=""` for quick checks or CPU tests on a GPU host.
+- Pass `--env <name>`, built-in `--env venv` (auto-activates `<remote_workspace>/.venv/bin`), or built-in `--env none`.
+- On CPU hosts (`device = "cpu"`), no `CUDA_VISIBLE_DEVICES` or `CUBLAS_WORKSPACE_CONFIG` env vars are injected.
+
+---
+
+## 2. Four-Category Sync & Data Model
+
+| Content Type | Controlled By | Uploaded? | Remote Deletion / Protection |
+|---|---|---|---|
+| **1. Source & tracked files** | Default (non-ignored files) | Yes (incremental `rsync`) | Tracked in `.remote-run-synced.json`; automatically pruned ONLY if previously uploaded AND truly deleted/renamed locally |
+| **2. Ignored files** | `.gitignore` + `BUILTIN_IGNORE` + `[sync].ignore` | No | Skipped during upload; newly ignored files that still exist locally are **never** deleted remotely |
+| **3. Remote-owned outputs & caches** | `BUILTIN_PRESERVE` + `[sync].preserve` | No | Bidirectional protection: never uploaded/overwritten and never deleted by `--delete` or ghost cleanup |
+| **4. Shared assets** | `[share].project` (per-project symlinks)<br>`[share].host` (read-only host assets) | No | `project` mounts `projects/<id>/shared/<dir>` via symlinks + auto-preserve; `host` checks path/SHA-256 and sets `REMOTE_RUN_SHARED_*` env vars (no symlinks) |
+
+Built-in ignores: `.git/`, `.venv/`, `venv/`, `__pycache__/`, `*.pyc`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `node_modules/`, `.DS_Store`, `/results/` (anchored at repo root so `src/results/` is still synced).
+Built-in preserves: `.venv`, `outputs`, `checkpoints`, `.cache`.
 
 ### Moving Local Folders & Multi-Worktree Development
-- Moving `/a/my-proj` to `/b/my-proj` keeps the same remote workspace (keyed by common repo name + root commit + branch, or explicit `project` in `.remote-run.toml`), never local absolute paths.
-- Opening multiple Git worktrees on different branches gives each branch an isolated remote code directory (`.../workspaces/<branch>`) while sharing `[share].project` directories (`.../shared/<name>`).
-- Single-directory developers who switch branches in-place (`git checkout feat`) can set `workspace = "default"` in `.remote-run.toml` to reuse `.venv/` and build caches across branches.
-- Pass `--remote-dir /abs/path` (or set `remote_dir` in `.remote-run.toml`) to target an exact remote directory directly (cannot be combined with `[share].project`; pre-existing non-empty folders require explicit `remote-run sync --adopt`).
+- Project identity is derived from repo name + root commit (never local absolute path), so moving a local folder preserves the remote workspace.
+- **Single-checkout repos** default to `workspace_id = "default"`, so switching branches with `git checkout -b ...` preserves remote `target/`, `build/`, `.venv/`, and `node_modules/`.
+- **Linked Git worktrees** (`git worktree add`) automatically isolate per branch under `projects/<id>/workspaces/<branch>` while sharing `[share].project` directories.
+- Pass `--remote-dir <path>` (or set `remote_dir` in `.remote-run.toml`) to target a specific remote directory (cannot combine with `[share].project`; claiming a non-empty unmanaged dir for sync requires `remote-run sync --adopt` once).
 
-## 2. Daily Commands
+---
+
+## 3. Daily Commands
 
 ```bash
-# Quick check without syncing or waiting behind a GPU job
-remote-run exec --no-sync --no-gpu -- nvidia-smi
+# Live streaming execution (prints metadata JSON to stderr, exits 0/2; Ctrl-C detaches locally)
+remote-run exec --follow -- cargo test
+remote-run exec --env venv -- uv run pytest -q
 
-# Project-local uv/.venv workflow
-remote-run exec --env venv -- uv run pytest
+# Override GPU or skip GPU lock for one command
+remote-run exec --no-gpu --no-sync -- nvidia-smi
+remote-run exec --device cuda:0,1 -- torchrun --nproc_per_node=2 train.py
 
-# Preview and clean stale remote files if you deleted/renamed local files
-remote-run sync --dry-run --delete
-remote-run sync --delete
+# Run directly in an arbitrary remote dir without syncing laptop files
+remote-run exec --no-gpu --no-sync --remote-dir ~/datasets/v1 --shell "hf download ... --local-dir ."
 
-# Opt-in persistent session across calls
+# Opt-in persistent shell across commands (saves cwd & env diffs when exit_code == 0)
 remote-run exec --session dev --shell "cd sub && export TAG=v1"
 remote-run exec --session dev --no-sync --shell 'pwd && echo $TAG'
+remote-run session list --repo .
 remote-run session reset dev
 
-# Readable terminal logs on test failures (--print-log) or indented JSON (--pretty)
-remote-run exec --print-log -- pytest -v
-
-# Reconnect after disconnect / list project runs / inspect raw logs
-remote-run status RUN_ID --wait 30
+# Check status, follow an existing detached run, list runs, or attach manually over SSH
+remote-run status RUN_ID --wait 30 --print-log
+remote-run status RUN_ID --follow
 remote-run status --repo .
-remote-run status RUN_ID --offset 8192 --raw-log
+# ssh -t <ssh_target> tmux attach -t <tmux_session>
 
-# Cancel a queued or running job cleanly (kills PGID + frees VRAM, keeps logs)
+# Cancel cleanly (kills PGID + tmux session) & pull results / specific workspace paths
 remote-run cancel RUN_ID
+remote-run pull RUN_ID ./results/RUN_ID
+remote-run pull RUN_ID ./results/RUN_ID --path reports/bench.md --paths-only --force
 
-# Pull logs, metadata, and eligible artifacts (or merge only extra workspace paths with --paths-only --force)
-remote-run pull RUN_ID ./results/RUN_ID --path outputs/notes.txt
-remote-run pull RUN_ID ./results/RUN_ID --path outputs/preds.npz --paths-only --force
-
-# Inspect or clean old terminal runs (>14 days) on the host (skips unmanaged dirs)
+# Preview stale files or prune old terminal run directories (>14 days)
+remote-run sync --dry-run --delete
 remote-run prune --days 14
 remote-run prune --days 14 --apply
 ```
 
-## 3. Global Cross-Harness Installation (`agy`, `Codex`, `Claude Code`)
+## 4. Multi-Harness Agent Setup (`agy`, Codex, Claude Code)
 
-See [skills/remote-run/references/schema-and-setup.md](../skills/remote-run/references/schema-and-setup.md) for the exact multi-harness setup commands.
+See [skills/remote-run/references/schema-and-setup.md](../skills/remote-run/references/schema-and-setup.md) for the leveled TOML schema and exact installation commands.
