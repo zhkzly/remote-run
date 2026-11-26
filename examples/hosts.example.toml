@@ -1,0 +1,36 @@
+schema_version = 1
+default_host = "desktop"
+
+[hosts.desktop]
+ssh = "linux_desktop"
+root = "/data/your-user/remote-run-jobs"
+# locks_dir = "/data/your-user/remote-run-locks"  # optional; defaults to <root>/locks
+device = "cuda:0"
+# gpu_slot = "gpu-0"                              # optional; defaults to gpu-0 for cuda:0
+default_env = "pytorch"
+# path_prepend = ["/home/your-user/.local/bin", "/home/your-user/.cargo/bin"]
+
+[hosts.desktop.envs.pytorch]
+python = "/data/your-user/envs/pytorch/bin/python"
+# [hosts.desktop.envs.pytorch.env]
+# HF_HOME = "/data/your-user/hf-cache"
+
+[hosts.desktop.envs.system]
+python = "/usr/bin/python3"
+
+# Recommended: CPU profile on the same machine so builds/tests skip GPU locks
+[hosts.desktop_cpu]
+ssh = "linux_desktop"
+root = "/data/your-user/remote-run-jobs"
+device = "cpu"
+default_env = "venv"
+# path_prepend = ["/home/your-user/.local/bin"]
+
+# Optional host-level shared assets (datasets, HF cache, pretrained weights).
+# [hosts.desktop.shared.hf-cache]
+# path = "/data/your-user/hf-cache"
+
+# [hosts.desktop.shared.pinned-dataset]
+# path = "/data/your-user/datasets/v1"
+# manifest = "manifest.json"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
