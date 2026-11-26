@@ -1527,7 +1527,10 @@ def remote_submit(root, job, host, request, worker_src):
         raise ValueError(f"Configured Python does not exist on host: {req_to_save['python']}")
     workdir = Path(remote_path(req_to_save["workdir"], "workdir"))
     if request.get("require_workdir") and not workdir.is_dir():
-        raise ValueError(f"No remote workspace at {workdir}. Sync it first or pass an explicit --remote-dir.")
+        raise ValueError(
+            f"No remote workspace at {workdir}. Sync it first, pass an explicit --remote-dir "
+            "(keeps project env and shared settings), or use --no-project --no-sync for an ad-hoc host check."
+        )
     if workdir != root:
         validate_remote_workdir(root, workdir)
     else:

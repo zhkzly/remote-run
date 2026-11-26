@@ -84,4 +84,6 @@ Validate anytime with `remote-run config`.
    agy mcp add remote-run ~/.local/bin/remote-run-mcp
    ```
    - **Claude Code note**: Start a **new** Claude Code session after registering the MCP server so `mcp__remote-run__*` tools attach.
-   - **Claude Code read-only allowlist (optional)**: Add `"mcp__remote-run__remote_hosts"`, `"mcp__remote-run__remote_config"`, `"mcp__remote-run__remote_status"` to `.claude/settings.json` `permissions.allow`. Doctor can execute configured probes and should receive its own approval.
+   - **Claude Code allowlist (recommended)**: Add `permissions.allow` in **user-global `~/.claude/settings.json`** (so linked Git / Orca worktrees inherit it automatically) rather than only per-repo `.claude/settings.json`:
+     - Safe read-only inspection tools: `"mcp__remote-run__remote_hosts"`, `"mcp__remote-run__remote_config"`, `"mcp__remote-run__remote_status"`.
+     - Diagnostic probes: `"mcp__remote-run__remote_doctor"` is non-destructive (`destructiveHint: false`) but can execute configured Python/CUDA probes (`readOnlyHint: false`); add it to `permissions.allow` too if you trust your configured hosts/envs.

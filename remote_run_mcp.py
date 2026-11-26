@@ -53,7 +53,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "Optional local project dir to infer host, env, and [share].host from .remote-run.toml"},
+                "repo": {"type": "string", "description": "Absolute path to local project dir to infer host, env, and [share].host from .remote-run.toml (pass explicitly when calling via user-level MCP)"},
                 "host": {"type": "string", "description": "Optional host name override"},
                 "env": {"type": "string", "description": "Environment name to probe (or 'venv' / 'none')"},
                 "shared": {"type": "array", "items": {"type": "string"}, "description": "Host shared asset names to verify"},
@@ -64,7 +64,7 @@ TOOLS = [
             },
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
     },
     {
         "name": "remote_sync",
@@ -90,7 +90,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "Absolute path to local project dir (required unless no_sync=true)"},
+                "repo": {"type": "string", "description": "Absolute path to local project dir (required when syncing, and still recommended with no_sync=true whenever .remote-run.toml host/env/shared settings should apply)"},
                 "host": {"type": "string", "description": "Optional host name override"},
                 "remote_dir": {"type": "string", "description": "Optional explicit remote folder override"},
                 "workspace": {"type": "string", "description": "Optional workspace ID override"},
@@ -128,7 +128,7 @@ TOOLS = [
                 "raw_log": {"type": "boolean", "description": "Disable carriage-return folding"},
                 "limit": {"type": "integer", "description": "Max recent runs to list"},
                 "project": {"type": "string", "description": "Filter listed runs by project_id"},
-                "repo": {"type": "string", "description": "Filter listed runs by local project directory"},
+                "repo": {"type": "string", "description": "Absolute path to local project dir to filter listed runs by project"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "additionalProperties": False,

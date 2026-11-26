@@ -9,9 +9,7 @@ description: >-
 
 # remote-run
 
-Local editing stays on the laptop. Use the `remote-run` CLI (or `remote_*` MCP tools when already loaded in your toolset) whenever work should execute on a configured remote Linux host.
-
-CLI-only actions include `init`, explicit sync deletion and adoption, root initialization, `--follow` and `--print-log`. MCP validates inputs and requires `repo` for sync and uploading exec calls. Normal sync can change source and remove verified ghost files. Review the [CLI and MCP reference](../../docs/usage.md#cli-and-mcp-reference).
+Local editing stays on the laptop. When `remote_*` MCP tools are already loaded in your toolset, prefer them over shelling out via `Bash` (they support per-tool allowlisting in auto/permission-guarded modes and return `tail_bytes` logs directly without shell pipelines). Use the `remote-run` CLI for CLI-only actions (`init`, explicit sync `--delete`/`--adopt`, `doctor --init-root`, `--follow`, `--print-log`). Review the [CLI and MCP reference](../../docs/usage.md#cli-and-mcp-reference).
 
 ## Safety Rules (Read First)
 
@@ -34,6 +32,7 @@ CLI-only actions include `init`, explicit sync deletion and adoption, root initi
    remote-run doctor --repo . --check-cmd cargo
    remote-run doctor --repo . --env pytorch --check-cuda --check-import torch  # with the named env configured
    ```
+   - Use `doctor` / `remote_doctor` (`--check-cmd`, `--check-import`, `--check-cuda` / `check_cmds`, `check_imports`, `check_cuda`) instead of ad-hoc `exec --no-sync` commands to probe remote binaries, Python packages, shared assets, or GPU readiness.
    - Set `REMOTE_RUN_INHERIT_LOGIN_PATH=0` on the client to disable optional login PATH discovery. Noninteractive SSH must already find Python 3.11+. Doctor can execute configured Python and GPU probes.
 
 2. **Run commands on the remote host**:
@@ -49,7 +48,10 @@ CLI-only actions include `init`, explicit sync deletion and adoption, root initi
    remote-run exec --device cuda:0,1 -- torchrun --nproc_per_node=2 train.py
    remote-run exec --no-gpu -- bash run.sh "arg with space"
    ```
-   - **Direct remote actions without laptop upload**. Use `--no-project --no-sync` for a host check before the project has been synced. Include `repo` for MCP calls that use project settings.
+   - **Direct remote actions without laptop upload**:
+     - Use `--no-project --no-sync` (`no_project=true, no_sync=true`) for an ad-hoc host check before the project has been synced (ignores `.remote-run.toml`).
+     - Use `--no-sync --remote-dir <path>` **without** `--no-project` to run on an explicit directory (e.g., a host shared asset path from `hosts`/`doctor`) while **keeping `.remote-run.toml`'s `host`, `env`, `[share].host`, and `[env_vars]`** before the first sync.
+     - For MCP calls (`remote_doctor`, `remote_exec` even with `no_sync=true`, `remote_status`), always pass `repo` explicitly whenever `.remote-run.toml` settings should apply.
      ```bash
      remote-run exec --no-project --no-sync --no-gpu -- nvidia-smi
      remote-run exec --no-sync --no-gpu --remote-dir /path/on/remote --shell "hf download ..."
