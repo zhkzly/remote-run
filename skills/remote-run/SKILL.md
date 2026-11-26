@@ -40,9 +40,10 @@ Local editing and quick checks stay on the laptop. Use the `remote-run` CLI (or 
    remote-run exec -- python train.py --epochs 10
    remote-run exec --host cpu_box -- bash run.sh "arg with space"
    ```
-   - **Quick monitoring** (skips upload and GPU lock):
+   - **Quick monitoring & remote-direct heavy setup/downloads** (skips laptop upload and GPU lock — download HuggingFace/DVC datasets, unpack archives, or run `uv sync` directly on the remote host instead of pulling through the laptop first; pass `--remote-dir` only when the user gives a specific path):
      ```bash
      remote-run exec --no-sync --no-gpu -- nvidia-smi
+     remote-run exec --host cpu_box --no-sync --remote-dir /path/on/remote --shell "hf download ..."
      ```
    - **Opt-in persistent shell** (saves `cwd` and env diffs across calls when `exit_code == 0`):
      ```bash
