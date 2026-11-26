@@ -11,13 +11,13 @@ description: >-
 
 Local editing stays on the laptop. Use the `remote-run` CLI (or `remote_*` MCP tools when already loaded in your toolset) whenever work should execute on a configured remote Linux host.
 
-**CLI vs. MCP differences**: For safety, MCP intentionally omits `sync --delete`, `sync --adopt`, `doctor --init-root`, and blocking `--follow`. Use `remote-run init`, `sync --delete`, `sync --adopt`, `doctor --init-root`, and `--follow` from the CLI when needed. Both `remote_exec` and `remote_sync` automatically clean up previously uploaded ghost files after local deletes/renames.
+CLI-only actions include `init`, explicit sync deletion and adoption, root initialization, `--follow` and `--print-log`. MCP validates inputs and requires `repo` for sync and uploading exec calls. Normal sync can change source and remove verified ghost files. Review the [CLI and MCP reference](../../docs/usage.md#cli-and-mcp-reference).
 
 ## Safety Rules (Read First)
 
 1. **4-category sync protects remote data**:
-   - Regular synced files deleted/renamed locally are safely removed on remote via `.remote-run-synced.json` — newly ignored files that still exist locally are **never** deleted.
-   - Remote-owned directories (`.venv/`, `outputs/`, `checkpoints/`, `.cache/`, plus `.remote-run.toml` `[sync].preserve` and `[share].project`) are excluded from upload and never deleted.
+   - Default cleanup requires an absent and unignored local path and a matching registered remote file version. Unverified copies are kept.
+   - Workspace-root `.venv/`, `outputs/`, `checkpoints/`, `.cache/` and paths in `[sync].preserve` or `[share].project` are excluded from upload and managed cleanup. Common local credentials and project config are excluded from upload.
 2. **Ownership markers protect existing data**: Managed roots (`.remote-run-root.json`) and workspaces (`.remote-run-workspace.json`) verify identity before syncing. Syncing into a pre-existing non-empty unmanaged folder or another project's workspace is rejected in code.
 3. **Never run destructive actions without explicit user confirmation**:
    - Prefer managed workspaces; do **not** pass `--remote-dir` unless the user gives an explicit remote path.
@@ -32,16 +32,16 @@ Local editing stays on the laptop. Use the `remote-run` CLI (or `remote_*` MCP t
    remote-run config                                        # inspect workspace_id, ignore, preserve
    remote-run doctor --repo . --check-cmd bash --check-cmd rsync
    remote-run doctor --repo . --check-cmd cargo
-   remote-run doctor --repo . --check-cuda --check-import torch
+   remote-run doctor --repo . --env pytorch --check-cuda --check-import torch  # with the named env configured
    ```
-   - Remote `PATH` automatically inherits the remote login shell `PATH` (set `REMOTE_RUN_INHERIT_LOGIN_PATH=0` to disable), so user-installed tools work out of the box; explicit `path_prepend` and env `path_prepend` take highest priority.
+   - Set `REMOTE_RUN_INHERIT_LOGIN_PATH=0` on the client to disable optional login PATH discovery. Noninteractive SSH must already find Python 3.11+. Doctor can execute configured Python and GPU probes.
 
 2. **Run commands on the remote host**:
    - `exec` is **stateless by default** (isolated `tmux` + PGID, auto-detaches if longer than `--wait`, default `15`s).
-   - **Workspace isolation**: Single-checkout repos default to `workspace_id = "default"` so `git checkout -b` keeps build caches (`target/`, `build/`, `.venv/`). Linked Git worktrees automatically isolate per branch and share `[share].project`.
-   - **Device & GPU concurrency**: CPU hosts run lock-free with no CUDA env vars injected. CUDA hosts default to host `device` slot lock(s); override per run with `--no-gpu` (lock-free, `CUDA_VISIBLE_DEVICES=""`) or `--device cuda:N[,M...]` (acquires sorted slot locks, e.g., `gpu-0` + `gpu-1` for `cuda:0,1`).
+   - Single checkouts use `default`. Linked Git worktrees isolate per checkout and share `[share].project`. Sync rejects a workspace with active jobs. Add build caches to `[sync].preserve` explicitly.
+   - CPU jobs skip card locks. `--no-gpu` clears `CUDA_VISIBLE_DEVICES`. A CUDA job takes sorted per-card locks and any configured legacy lock. Coordination is scoped to the lock directory.
    - **Environments**: uses project `env` or host `default_env`, or pass `--env <name>` / `--env venv` (`<workdir>/.venv/bin`) / `--env none`.
-   - **Exit codes**: remote failure (`failed`/`cancelled`/`interrupted`) prints JSON receipt and exits `2`; `exec` exceeding `--wait` detaches cleanly and exits `0` (`detached: true`); local config/SSH errors exit `1`. Pass `--follow` for live terminal streaming (prints metadata JSON to stderr) or `--print-log` / `--pretty`.
+   - `exec` and `status --follow` exit 2 for terminal task failures. Plain status exits 0 on successful inspection. Detach exits 0, runtime and SSH errors exit 1, and Ctrl-C stops the local wait with 130. Follow streams stdout and places metadata on stderr.
    ```bash
    remote-run exec --follow -- cargo test
    remote-run exec --env venv -- uv run pytest -q
@@ -49,12 +49,12 @@ Local editing stays on the laptop. Use the `remote-run` CLI (or `remote_*` MCP t
    remote-run exec --device cuda:0,1 -- torchrun --nproc_per_node=2 train.py
    remote-run exec --no-gpu -- bash run.sh "arg with space"
    ```
-   - **Direct remote actions without laptop upload** (pass `--no-sync`, plus `--no-gpu` for light/download tasks, and `--remote-dir` only when user specifies a path):
+   - **Direct remote actions without laptop upload**. Use `--no-project --no-sync` for a host check before the project has been synced. Include `repo` for MCP calls that use project settings.
      ```bash
-     remote-run exec --no-sync --no-gpu -- nvidia-smi
+     remote-run exec --no-project --no-sync --no-gpu -- nvidia-smi
      remote-run exec --no-sync --no-gpu --remote-dir /path/on/remote --shell "hf download ..."
      ```
-   - **Opt-in persistent shell** (saves `cwd` and env diffs across calls when `exit_code == 0`):
+   - **Opt-in persistent shell** (serializes calls per session, saves cwd and exported environment changes on success, and resets only while idle):
      ```bash
      remote-run exec --session dev --shell "cd sub && export TAG=v1"
      remote-run exec --session dev --no-sync -- make test
@@ -75,13 +75,13 @@ Local editing stays on the laptop. Use the `remote-run` CLI (or `remote_*` MCP t
    remote-run status RUN_ID --wait 30
    remote-run status RUN_ID --follow
    remote-run status --repo .
-   remote-run cancel RUN_ID                       # kills process group & tmux session cleanly
+   remote-run cancel RUN_ID                       # signal the verified process group and report observed state
    remote-run pull RUN_ID ./results/RUN_ID
    remote-run pull RUN_ID ./results/RUN_ID --path reports/bench.md --paths-only --force
    remote-run sync --dry-run --delete
    remote-run prune --days 14                     # dry-run; ask user before --apply
    ```
-   - `pull` skips ML checkpoints (`.pt`, `.pth`, `.ckpt`, `.safetensors`, `.onnx`, `.h5`) and files > `--max-file-mb` (default `10` MB) unless `--all-artifacts` is passed. `.bin` artifacts within size limit are pulled normally.
+   - `pull` applies checkpoint suffix and 10 MiB per-file limits to automatically selected artifacts. Explicit workspace paths are independent. Private request metadata is excluded from default pull. Prune skips jobs without a run ownership marker.
 
 ## 2. Optional 2-File Config & Multi-Harness Setup
 

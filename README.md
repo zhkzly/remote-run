@@ -10,7 +10,7 @@
 
 > **Edit locally with Claude Code, Codex, or Antigravity (`agy`). Execute transparently on any remote Linux host—CPU or GPU, any language, zero remote AI setup.**
 
-Keep your editor, AI agents, API keys, MCP servers, and local source tree on your laptop. Turn any Linux server, lab desktop, or cloud VM into an invisible remote compute backend with almost zero configuration.
+Keep your editor, AI agents and MCP services on your laptop. Upload the project files needed for the run. Turn any Linux server, lab desktop, or cloud VM into an invisible remote compute backend with almost zero configuration.
 
 ---
 
@@ -40,11 +40,11 @@ Any Remote Linux Host (Zero AI tools, zero sudo, no daemon to install)
 
 ## Common Use Cases
 
-1. **Any-language edit–test–build loop**: Write **Rust, Go, C++, Node/TS, or Python** locally and run `remote-run exec --follow -- cargo test` or `pytest -q`. Owned-file manifest tracking (`.remote-run-synced.json`) safely removes ghost files when you delete or rename local source files—without ever deleting remote outputs, build caches, or newly ignored files.
-2. **Normal checkouts keep caches across branches**: Switching branches in a single local checkout keeps `default` on the remote host (preserving `target/`, `build/`, `.venv/`, `node_modules/`). Actual linked Git worktrees automatically isolate per worktree while sharing `[share].project`.
+1. **Any-language edit–test–build loop**: Write **Rust, Go, C++, Node/TS, or Python** locally and run `remote-run exec --follow -- cargo test` or `pytest -q`. Owned-file manifest tracking (`.remote-run-synced.json`) safely removes ghost files when you delete or rename local source files—when the remote copy still matches its recorded version. Configure `[sync].preserve` for remote outputs and caches.
+2. **Normal checkouts keep caches across branches**: Switching branches in a single local checkout keeps `default` on the remote host (keeping excluded and preserved caches in place). Linked Git worktrees automatically isolate by checkout identity while sharing `[share].project`.
 3. **Zero-setup rented cloud VMs & lab GPUs**: Keep AI keys and prompts on your laptop; onboard any box in seconds with `remote-run init user@host --port 22345` (zero `sudo`, no remote daemon).
-4. **Multi-hour GPU runs without VRAM collisions**: Jobs exceeding `--wait` (default `15s`) detach into remote `tmux`; CUDA hosts serialize cleanly on sorted GPU locks (including multi-GPU `--device cuda:0,1` acquiring both `gpu-0` and `gpu-1` in deadlock-free order) and release VRAM via PGID kill on `cancel`. Light tasks use `--no-gpu` to run lock-free with `CUDA_VISIBLE_DEVICES=""`.
-5. **AI Agent native (CLI + MCP + Skill)**: Exposes equivalent workflows via terminal CLI, zero-dependency stdio MCP (`remote_*`), and a progressive-disclosure `SKILL.md`.
+4. **Long-running GPU jobs.** Jobs start in remote `tmux` and continue after the local `--wait` window (default `15s`). CUDA jobs take sorted per-card locks in the configured lock directory. `cancel` signals the verified process group. Use `--no-gpu` to skip card locks and clear `CUDA_VISIBLE_DEVICES` for programs that honor it.
+5. **AI Agent native (CLI + MCP + Skill)**: Exposes equivalent workflows via terminal CLI, standard-library stdio MCP (`remote_*`), and an Agent Skill. See the [CLI and MCP reference](docs/usage.md#cli-and-mcp-reference) for supported fields.
 
 ---
 
@@ -52,14 +52,15 @@ Any Remote Linux Host (Zero AI tools, zero sudo, no daemon to install)
 
 ### Prerequisites
 
-- **Laptop**: Linux or macOS (`rsync` auto-adapts for macOS), Python 3.11+, `ssh`
-- **Remote Linux host**: Python 3.11+, `bash`, `tmux`, `rsync` (no `git` or `sudo` needed on the remote host), batch-mode SSH auth (`ssh -o BatchMode=yes <target> true`)
+- **Laptop**: Linux or macOS, Bash, Python 3.11+ on `PATH`, `ssh` and `rsync`. Git supplies project identity and Git ignore rules
+- **Remote Linux host**: Python 3.11+, `bash`, `tmux`, `rsync` (no `git` or `sudo` needed on the remote host), batch-mode SSH auth and an already verified host key in `known_hosts` (`ssh -o BatchMode=yes <target> true`)
 
 ### 1. Clone and link CLI & MCP binaries
 
 ```bash
 git clone https://github.com/zhkzly/remote-run.git ~/remote-run
 mkdir -p ~/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
 ln -sf ~/remote-run/bin/remote-run ~/.local/bin/remote-run
 ln -sf ~/remote-run/bin/remote-run-mcp ~/.local/bin/remote-run-mcp
 ```
@@ -87,6 +88,7 @@ Verify SSH, tools (`bash`/`tmux`/`rsync`), optional commands (`--check-cmd`), an
 
 ```bash
 remote-run doctor --check-cmd cargo --pretty
+# Add ~/.local/bin to your shell startup PATH for future shells.
 # If `root` points to a pre-existing non-empty directory you own:
 remote-run doctor --init-root
 ```
@@ -105,7 +107,7 @@ codex mcp add remote-run -- ~/.local/bin/remote-run-mcp
 agy mcp add remote-run ~/.local/bin/remote-run-mcp
 ```
 
-### 4. Run anything from your local repo
+### 4. Run from your local repo
 
 ```bash
 # Sync changes and stream remote output live (works for Rust, Go, C++, Node, Python...)
@@ -117,7 +119,7 @@ remote-run exec --no-gpu -- pytest -q
 remote-run exec --device cuda:0,1 -- torchrun --nproc_per_node=2 train.py
 
 # Direct remote action without uploading laptop files (e.g., download dataset directly on host)
-remote-run exec --no-gpu --no-sync --remote-dir ~/datasets/v1 --shell "hf download ... --local-dir ."
+remote-run exec --no-gpu --no-sync --remote-dir '~/datasets/v1' --shell "hf download ... --local-dir ."
 
 # Opt-in persistent shell session (keeps cd & env diffs across calls when exit_code == 0)
 remote-run exec --session dev --shell "cd sub && export TAG=v1"
@@ -133,10 +135,10 @@ remote-run pull RUN_ID ./results/RUN_ID
 
 ## Safety Designed for Shared Servers & AI Agents
 
-1. **Zero silent data loss**: Sync never deletes remote-owned files or newly ignored files. Only regular files previously uploaded by `remote-run` (tracked in `.remote-run-synced.json`) that no longer exist locally are automatically pruned on rename/delete.
-2. **Ownership & topology guards**: Roots require `.remote-run-root.json`, managed workspaces require `.remote-run-workspace.json`, pre-existing non-empty folders require explicit `--init-root` / `--adopt`, and `/`, `$HOME`, ancestors, control dirs, and pull symlink escapes are rejected in code.
-3. **Multi-user privacy**: SSH `ControlMaster` sockets, `locks/`, `sessions/`, and `runs/` (`request.json` env vars, logs, artifacts) are locked down to mode `0700` while preserving your workspace's natural `umask`.
-4. **Safe cleanup & retrieval**: `prune` is dry-run by default and never touches live or unmanaged directories; `pull` skips ML checkpoint suffixes (`.pt`, `.pth`, `.ckpt`, `.safetensors`, `.onnx`, `.h5`) and files >10 MB unless `--all-artifacts` is passed.
+1. **Owned source cleanup.** Default sync removes an absent source only when the remote regular file matches its registered version. Keep remote-generated files in preserved paths and preview explicit mirroring with `sync --dry-run --delete`.
+2. **Managed directories.** Root, workspace and run ownership markers identify where the tool may write or prune. Control directories require trusted paths. An existing non-empty root or workspace requires explicit initialization or adoption.
+3. **Private state.** SSH sockets, runs, sessions and lock directories are private. Common local credential files are excluded. Inspection outputs redact configured environment values. Job output can still include whatever the command prints.
+4. **Cleanup and retrieval.** `prune` previews by default and skips unmarked jobs. `pull` copies log, state and eligible artifacts, with a default 10 MiB cap per automatically selected artifact. Explicit workspace paths follow separate rules in [the usage guide](docs/usage.md).
 
 ---
 
@@ -148,11 +150,11 @@ Zero-dependency JSON-RPC 2.0 stdio server (`2025-06-18` / `2025-03-26` / `2024-1
 |---|---|---|
 | `remote_hosts` | List hosts, devices, named environments, and shared assets | Read-only |
 | `remote_config` | Inspect merged `hosts.toml` + `.remote-run.toml` config & rules | Read-only |
-| `remote_doctor` | Probe SSH, `bash`/`tmux`/`rsync`, `--check-cmd`, GPUs, imports, shared SHA-256 | Read-only check |
-| `remote_sync` | Incremental sync (+ safe ghost cleanup for deleted owned files) | Never exposes `delete` or `adopt` |
+| `remote_doctor` | Probe SSH, `bash`/`tmux`/`rsync`, `--check-cmd`, GPUs, imports, shared SHA-256 | Optional executable probes |
+| `remote_sync` | Incremental sync (+ safe ghost cleanup for deleted owned files) | May replace source and prune owned files. Preview with `dry_run` |
 | `remote_exec` | Sync (unless `no_sync=true`) and run command/shell (`device`, `no_gpu`, `wait`) | PGID + `tmux` isolation |
 | `remote_status` | Poll job state / byte-offset logs (`tmux_session` included) or list runs | Read-only |
-| `remote_cancel` | Cancel queued/running job by PGID + `tmux` while preserving logs | `destructiveHint` |
+| `remote_cancel` | Request cancellation and report observed status, keeping logs | `destructiveHint` |
 | `remote_pull` | Pull logs, metadata, artifacts, or `--path` workspace files | Skips large/checkpoint artifacts by default |
 | `remote_session` | List or reset opt-in persistent shell sessions (`cwd` + `env`) | Explicit reset only |
 | `remote_prune` | Preview or clean expired terminal run dirs (`dry-run` unless `apply: true`) | Whitelist-only |

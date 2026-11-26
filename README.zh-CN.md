@@ -10,7 +10,7 @@
 
 > **本机编写代码与运行 AI Agent（Claude Code / Codex / Antigravity），远程 Linux 透明执行——不限语言、不限 GPU，远端零 AI 配置，几乎零配置即可开跑。**
 
-把编辑器、AI Agent、API Key、MCP、Skill 和源码全留在自己笔记本上；把任意一台 Linux 服务器、台式机或云主机变成透明可用的远端算力。
+编辑器、AI Agent 和 MCP 服务留在笔记本。项目文件按同步规则上传，命令在具备先决工具的 Linux 主机上执行。
 
 ---
 
@@ -40,11 +40,11 @@
 
 ## 核心场景
 
-1. **全语言透明开发测试**：本地编写 **Rust / Go / C++ / Node / Python**，直接 `remote-run exec --follow -- cargo test` 或 `pytest`。内置 `.remote-run-synced.json` 清单会在你本地删除/重命名源码时自动清理对应远端“幽灵文件”，同时绝不碰远端自有产物和新加入 `ignore` 的文件。
-2. **切分支不丢缓存**：普通单仓库 `git checkout -b` 默认保留在 `default` 远端工作区（保住 `target/`、`build/`、`.venv/`、`node_modules/`）；只有真开了多个 Git worktree 时才按工作树自动隔离，并支持 `[share].project` 共享目录。
+1. **全语言透明开发测试**：本地编写 **Rust / Go / C++ / Node / Python**，直接 `remote-run exec --follow -- cargo test` 或 `pytest`。内置 `.remote-run-synced.json` 清单会在你本地删除/重命名源码时自动清理对应远端“幽灵文件”，仅清理仍与登记版本一致的远端副本。远端自产文件和缓存放进 `[sync].preserve`。
+2. **切分支不丢缓存**：普通单仓库 `git checkout -b` 默认保留在 `default` 远端工作区（已配置排除或保留的缓存可以继续用）；只有真开了多个 Git worktree 时才按工作树自动隔离，并支持 `[share].project` 共享目录。
 3. **3 行配置 / 一键 `init` 上手**：`remote-run init user@1.2.3.4 --port 22345` 自动探测远程工具与显卡并写入 `hosts.toml`；全流程免交互 SSH、远端零 `sudo`。
-4. **安全并发 GPU 训练**：超过 `--wait`（默认 15 秒）自动转入远端 `tmux` 保活；单卡/多卡（`--device cuda:0,1` 按序同时锁定 `gpu-0` 与 `gpu-1`，天然防死锁防撞卡）；轻任务可随时加 `--no-gpu` 走无锁 CPU 通道。
-5. **AI Agent 原生友好**：同时提供 **CLI**、并发 **stdio MCP（`remote_*`）** 和渐进式 **Agent Skill**，并从代码层锁死防误删与防路径逃逸边界。
+4. **长时间 GPU 作业。** 作业从开始即运行于远端 `tmux`，超过本地 `--wait`（默认 15 秒）后继续运行。CUDA 作业在同一锁目录按卡号顺序加锁。取消会向已核实的进程组发信号。`--no-gpu` 跳过卡锁并清空 `CUDA_VISIBLE_DEVICES`，供遵守该变量的程序使用。
+5. **AI Agent 原生友好**：同时提供 **CLI**、并发 **stdio MCP（`remote_*`）** 和渐进式 **Agent Skill**。支持字段见 [CLI 与 MCP 契约](docs/usage.md#cli-and-mcp-reference)。
 
 ---
 
@@ -52,14 +52,15 @@
 
 ### 环境要求
 
-- **本地笔记本**：Linux 或 macOS（自动兼容 macOS 系统 `rsync`）、Python 3.11+、`ssh`
-- **远端 Linux 主机**：Python 3.11+、`bash`、`tmux`、`rsync`（无需远端 `git`，无需 `sudo`），并配通免密 SSH（`ssh -o BatchMode=yes <target> true`）
+- **本地笔记本**：Linux 或 macOS，Bash、PATH 上的 Python 3.11+、`ssh`、`rsync`。Git 提供项目身份和忽略规则
+- **远端 Linux 主机**：Python 3.11+、`bash`、`tmux`、`rsync`（无需远端 `git`，无需 `sudo`），配置免交互 SSH，并预先验证主机公钥写入 `known_hosts`（`ssh -o BatchMode=yes <target> true`）
 
 ### 1. 克隆并链接入口命令
 
 ```bash
 git clone https://github.com/zhkzly/remote-run.git ~/remote-run
 mkdir -p ~/.local/bin
+export PATH="$HOME/.local/bin:$PATH"
 ln -sf ~/remote-run/bin/remote-run ~/.local/bin/remote-run
 ln -sf ~/remote-run/bin/remote-run-mcp ~/.local/bin/remote-run-mcp
 ```
@@ -117,7 +118,7 @@ remote-run exec --no-gpu -- pytest -q
 remote-run exec --device cuda:0,1 -- torchrun --nproc_per_node=2 train.py
 
 # 不同步本地目录，直接让远端执行下载/环境安装
-remote-run exec --no-gpu --no-sync --remote-dir ~/datasets/v1 --shell "hf download ... --local-dir ."
+remote-run exec --no-gpu --no-sync --remote-dir '~/datasets/v1' --shell "hf download ... --local-dir ."
 
 # 按需持久 shell 会话（仅在 exit_code == 0 时保留 cd 和环境变量变更）
 remote-run exec --session dev --shell "cd sub && export TAG=v1"
@@ -133,10 +134,10 @@ remote-run pull RUN_ID ./results/RUN_ID
 
 ## 面向共享服务器与 AI Agent 的安全护栏
 
-1. **零静默误删**：永远不删远端自产文件或新忽略的文件；仅在本地确实删除/重命名源码时，依据 `.remote-run-synced.json` 清单安全清理曾经上传过的同名文件。
-2. **双重归属与动态拓扑防线**：根目录校验 `.remote-run-root.json`，工作区校验 `.remote-run-workspace.json`；代码层拒绝 `/`、`$HOME` 及祖先、控制目录与 `pull` 软链逃逸。
-3. **多用户主机隐私保护**：SSH `ControlMaster`、`locks/`、`sessions/` 与 `runs/`（含环境变量和日志）均强制 `0700` 权限，同时保留项目工作区自然的 `umask`。
-4. **白名单清理与分级拉回**：`prune` 默认 dry-run；`pull` 默认跳过大文件（>10 MB）与模型权重后缀（`.pt` / `.pth` / `.ckpt` / `.safetensors` / `.onnx` / `.h5`），需要时加 `--all-artifacts`。
+1. **清理已登记的源码。** 默认同步仅在本地文件缺失且远端普通文件仍与登记版本一致时清理。远端自产文件放到保留路径。显式镜像前使用 `sync --dry-run --delete` 预览。
+2. **托管目录。** 根、工作区和作业的标记用于核对归属。控制目录要求可信路径。已有非空根目录或工作区须显式初始化或认领。
+3. **私有状态。** SSH socket、运行、会话和锁目录使用私有权限。常见本地凭据文件被排除，检查接口会遮蔽配置中的环境值。命令输出仍可能包含程序主动打印的内容。
+4. **清理和拉取。** `prune` 默认只预览，跳过没有归属标记的运行。默认 `pull` 拉取日志、状态和符合条件的产物，自动选取的单个产物默认上限 10 MiB。显式工作区路径的规则见[使用手册](docs/usage.md)。
 
 ---
 
@@ -148,11 +149,11 @@ remote-run pull RUN_ID ./results/RUN_ID
 |---|---|---|
 | `remote_hosts` | 列出主机、设备、命名环境与共享资产 | 只读 |
 | `remote_config` | 校验并查看 `hosts.toml` + `.remote-run.toml` 生效配置 | 只读 |
-| `remote_doctor` | 检查 SSH、`bash`/`tmux`/`rsync`、`check_cmds`、GPU、Python 导入与 SHA-256 | 只读检查 |
-| `remote_sync` | 安全增量同步（含已上传幽灵文件清理） | 刻意不暴露 `delete` / `adopt` |
+| `remote_doctor` | 检查 SSH、`bash`/`tmux`/`rsync`、`check_cmds`、GPU、Python 导入与 SHA-256 | 可选的可执行探针 |
+| `remote_sync` | 安全增量同步（含已上传幽灵文件清理） | 可能替换源码与清理已登记文件，可先用 `dry_run` |
 | `remote_exec` | 同步并执行命令/shell（支持 `device`、`no_gpu`、`no_sync`、`wait`） | 独立 PGID + `tmux` 隔离 |
 | `remote_status` | 轮询任务状态（含 `tmux_session`）、字节增量日志或列任务 | 只读 |
-| `remote_cancel` | 按 PGID + `tmux` 安全终止任务，保留日志 | `destructiveHint` |
+| `remote_cancel` | 请求取消并报告观察到的状态，保留日志 | `destructiveHint` |
 | `remote_pull` | 拉取日志、元数据、产物或指定 `--path` 工作区文件 | 默认跳过大体积与权重产物 |
 | `remote_session` | 列出或重置可选的持久 shell 会话 | 显式触发 |
 | `remote_prune` | 预览或清理过期终态运行目录（默认只读） | 仅清理白名单终态目录 |

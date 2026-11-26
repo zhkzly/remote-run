@@ -2,14 +2,22 @@
 """Standardized zero-dependency MCP stdio server wrapping remote_run.py."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
+import time
 
 CLI = str(Path(__file__).resolve().parent / "remote_run.py")
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 STDOUT_LOCK = threading.Lock()
+CONTROL_TOOLS = {"remote_hosts", "remote_cancel"}
+MAX_PENDING = 32
+MAX_REQUEST_CHARS = 1024 * 1024
+REQUEST = threading.local()
 
 TOOLS = [
     {
@@ -56,11 +64,11 @@ TOOLS = [
             },
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     },
     {
         "name": "remote_sync",
-        "description": "One-way incremental rsync from local repository to its remote workspace (safely prunes previously uploaded ghost files deleted locally; never deletes remote-owned files).",
+        "description": "One-way incremental sync to a remote workspace. Can overwrite source paths and prune owned files. Use dry_run to preview.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -74,7 +82,7 @@ TOOLS = [
             "required": ["repo"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     },
     {
         "name": "remote_exec",
@@ -89,6 +97,7 @@ TOOLS = [
                 "command": {"type": "array", "items": {"type": "string"}, "description": "Argv array to execute (use either command or shell)"},
                 "shell": {"type": "string", "description": "Compound bash command string (use either shell or command)"},
                 "no_sync": {"type": "boolean", "description": "Skip rsync upload before executing"},
+                "no_project": {"type": "boolean", "description": "Ignore project config (requires no_sync)"},
                 "session": {"type": "string", "description": "Opt-in persistent shell session name"},
                 "wait": {"type": "number", "description": "Seconds to wait before detaching (0=async, default 15)"},
                 "device": {"type": "string", "description": "Per-run device override: 'cpu' or 'cuda:N[,M...]'"},
@@ -128,7 +137,7 @@ TOOLS = [
     },
     {
         "name": "remote_cancel",
-        "description": "Cancel a queued or running remote job cleanly (kills process group + tmux session, keeps logs).",
+        "description": "Request cancellation of a queued or running job, report the observed status and retain logs.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -199,6 +208,38 @@ TOOLS = [
 ]
 
 
+SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in TOOLS}
+
+
+def tool_error(message):
+    return {"content": [{"type": "text", "text": message}], "isError": True}
+
+
+def validate_argument(value, schema, label):
+    kind = schema["type"]
+    if kind == "number":
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f"{label} must be a finite number")
+    elif type(value) is not {"boolean": bool, "integer": int, "string": str, "array": list, "object": dict}[kind]:
+        raise ValueError(f"{label} must be a JSON {kind}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{label} must be one of {schema['enum']}")
+    if kind == "array":
+        for index, entry in enumerate(value):
+            validate_argument(entry, schema["items"], f"{label}[{index}]")
+    elif kind == "object":
+        properties = schema.get("properties", {})
+        missing = schema.get("required", ())
+        if any(key not in value for key in missing):
+            raise ValueError(f"{label} requires {', '.join(key for key in missing if key not in value)}")
+        additional = schema["additionalProperties"]
+        for key, entry in value.items():
+            child = properties.get(key, additional)
+            if child is False:
+                raise ValueError(f"Unknown argument {label}.{key}")
+            validate_argument(entry, child, f"{label}.{key}")
+
+
 def safe_pos(val, label):
     if not isinstance(val, str) or not val or val.startswith("-"):
         raise ValueError(f"Invalid {label}: {val!r}")
@@ -206,13 +247,36 @@ def safe_pos(val, label):
 
 
 def run_cli(argv, *, timeout=120):
-    proc = subprocess.run([sys.executable, "-B", CLI, *argv], capture_output=True, text=True, timeout=timeout)
-    if proc.returncode == 0:
-        return {"content": [{"type": "text", "text": proc.stdout.strip()}], "isError": False}
-    if proc.returncode == 2 and proc.stdout.strip():
-        return {"content": [{"type": "text", "text": proc.stdout.strip()}], "isError": True}
-    msg = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
-    return {"content": [{"type": "text", "text": msg}], "isError": True}
+    stopped = getattr(REQUEST, "cancelled", None)
+    if stopped is not None and stopped.is_set():
+        return tool_error("Request cancelled before launch")
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(
+        [sys.executable, "-B", CLI, *argv], stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    ) as proc:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (stopped is not None and stopped.is_set()):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=1)
+                except subprocess.TimeoutExpired as expired:
+                    stdout = (expired.stdout or b"").decode(errors="replace")
+                    stderr = (expired.stderr or b"").decode(errors="replace")
+                why = "Request cancelled locally" if stopped is not None and stopped.is_set() else "Request timed out"
+                return tool_error(f"{why}. {stderr.strip() or stdout.strip()}".strip())
+            try:
+                stdout, stderr = proc.communicate(timeout=min(remaining, 0.25))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    if proc.returncode == 0 or (proc.returncode == 2 and stdout.strip()):
+        return {"content": [{"type": "text", "text": stdout.strip()}], "isError": proc.returncode != 0}
+    return tool_error(stderr.strip() or stdout.strip() or f"exit {proc.returncode}")
 
 
 def check_list(val, label):
@@ -220,7 +284,7 @@ def check_list(val, label):
         return []
     if not isinstance(val, list):
         raise ValueError(f"{label} must be an array")
-    return [str(x) for x in val]
+    return val
 
 
 def check_str_map(val, label):
@@ -241,10 +305,18 @@ def common_flags(a):
 
 
 def call_tool(name, a):
-    if a is None:
-        a = {}
-    if not isinstance(a, dict):
-        return {"content": [{"type": "text", "text": "Tool arguments must be a JSON object"}], "isError": True}
+    if not isinstance(name, str) or name not in SCHEMAS:
+        return tool_error(f"Unknown tool: {name!r}")
+    try:
+        validate_argument(a, SCHEMAS[name], name)
+    except (OverflowError, ValueError) as exc:
+        return tool_error(str(exc))
+    if name == "remote_exec" and bool(a.get("command")) == bool(a.get("shell")):
+        return tool_error("remote_exec requires exactly one non-empty command or shell")
+    if name == "remote_exec" and a.get("no_project") and not a.get("no_sync"):
+        return tool_error("remote_exec no_project requires no_sync")
+    if name == "remote_pull" and a.get("paths_only") and not a.get("paths"):
+        return tool_error("remote_pull paths_only requires paths")
     if name == "remote_hosts":
         return run_cli([*(["--config", str(a["config"])] if a.get("config") is not None else []), "hosts"])
     if name == "remote_config":
@@ -284,7 +356,7 @@ def call_tool(name, a):
         if not a.get("no_sync") and not a.get("repo"):
             return {"content": [{"type": "text", "text": "remote_exec requires 'repo' unless no_sync=true"}], "isError": True}
         argv = [*common_flags(a), "exec"]
-        if a.get("no_sync") and not a.get("repo"):
+        if a.get("no_project"):
             argv.append("--no-project")
         for k, flag in (("repo", "--repo"), ("remote_dir", "--remote-dir"), ("workspace", "--workspace"),
                         ("session", "--session"), ("shell", "--shell"), ("device", "--device"),
@@ -381,39 +453,61 @@ def respond(msg_id, result=None, error=None):
         payload["error"] = error
     else:
         payload["result"] = result
-    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    line = json.dumps(payload, allow_nan=False) + "\n"
     with STDOUT_LOCK:
         sys.stdout.write(line)
         sys.stdout.flush()
 
 
-def handle_tool_call(msg_id, params):
+def handle_tool_call(msg_id, params, cancelled):
+    REQUEST.cancelled = cancelled
     try:
         respond(msg_id, call_tool(params.get("name", ""), params.get("arguments", {})))
     except Exception as exc:
-        respond(msg_id, {"content": [{"type": "text", "text": f"Tool error: {exc}"}], "isError": True})
+        respond(msg_id, tool_error(f"Tool error: {exc}"))
+    finally:
+        del REQUEST.cancelled
 
 
 def main():
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for line in sys.stdin:
+    capacity = threading.BoundedSemaphore(MAX_PENDING)
+    control_capacity = threading.BoundedSemaphore(MAX_PENDING)
+    pending = {}
+    with ThreadPoolExecutor(max_workers=8) as pool, ThreadPoolExecutor(max_workers=2) as control_pool:
+        while line := sys.stdin.readline(MAX_REQUEST_CHARS + 1):
+            if len(line) > MAX_REQUEST_CHARS:
+                while line and not line.endswith("\n"):
+                    line = sys.stdin.readline(MAX_REQUEST_CHARS + 1)
+                respond(None, error={"code": -32700, "message": "Request exceeds the size limit"})
+                continue
             line = line.strip()
             if not line:
                 continue
             try:
                 req = json.loads(line)
-            except json.JSONDecodeError as exc:
+            except (ValueError, RecursionError) as exc:
                 respond(None, error={"code": -32700, "message": f"Parse error: {exc}"})
                 continue
-            if not isinstance(req, dict):
-                respond(None, error={"code": -32600, "message": "Invalid Request: expected JSON object"})
+            if not isinstance(req, dict) or req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str):
+                respond(None, error={"code": -32600, "message": "Invalid JSON-RPC request"})
                 continue
             msg_id = req.get("id")
             method = req.get("method", "")
             params = req.get("params") or {}
             if not isinstance(params, dict):
                 params = {}
-            if method in ("notifications/initialized", "notifications/cancelled") or msg_id is None:
+            if method == "notifications/cancelled":
+                request_id = params.get("requestId")
+                if type(request_id) in (int, str) and request_id in pending:
+                    future, event = pending[request_id]
+                    event.set()
+                    if future.cancel():
+                        respond(request_id, tool_error("Request cancelled before launch"))
+                continue
+            if method == "notifications/initialized" or msg_id is None:
+                continue
+            if type(msg_id) not in (str, int):
+                respond(None, error={"code": -32600, "message": "Invalid JSON-RPC request ID"})
                 continue
             if method == "initialize":
                 req_ver = params.get("protocolVersion", "2024-11-05")
@@ -428,7 +522,21 @@ def main():
             elif method == "tools/list":
                 respond(msg_id, {"tools": TOOLS})
             elif method == "tools/call":
-                pool.submit(handle_tool_call, msg_id, params)
+                pending = {key: entry for key, entry in pending.items() if not entry[0].done()}
+                if msg_id in pending:
+                    respond(msg_id, error={"code": -32600, "message": "Request ID already active"})
+                    continue
+                name = params.get("name")
+                control_tool = isinstance(name, str) and name in CONTROL_TOOLS
+                slots = control_capacity if control_tool else capacity
+                if not slots.acquire(blocking=False):
+                    respond(msg_id, tool_error("Server busy. Retry after another request finishes."))
+                    continue
+                executor = control_pool if control_tool else pool
+                cancelled = threading.Event()
+                future = executor.submit(handle_tool_call, msg_id, params, cancelled)
+                pending[msg_id] = (future, cancelled)
+                future.add_done_callback(lambda _, semaphore=slots: semaphore.release())
             else:
                 respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
 

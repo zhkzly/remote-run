@@ -14,11 +14,11 @@ ssh = "my-server"                               # ~/.ssh/config alias or "user@h
 
 # 2. Optional Hardware Resource Aspect (omit on CPU-only servers)
 # device = "cuda:0"                             # "cpu" (default), "cuda:0", or "cuda:0,1" (enables sorted GPU locks + CUDA isolation)
-# locks_dir = "/data/your-user/remote-locks"    # Optional; defaults to <root>/locks
-# gpu_slot = "gpu-0"                            # Optional; overrides auto-derived gpu-N lock filename(s)
+# locks_dir = "/data/your-user/remote-locks"    # Optional private directory outside workspaces. Defaults to <root>/locks
+# gpu_slot = "gpu-0"                            # Optional legacy lock added to the per-card locks
 
 # 3. Optional Environment Overrides
-# remote-run inherits the remote login shell PATH automatically, so installed tools work out of the box.
+# Commands may inherit the remote login PATH. SSH must already find Python 3.11+.
 # Only set `path_prepend` for tools hidden inside interactive ~/.bashrc guards (e.g., nvm/conda) or custom toolchains.
 # default_env = "venv"                          # "venv", "none", or a named env defined below
 # path_prepend = ["/opt/custom/bin"]
@@ -30,7 +30,7 @@ ssh = "my-server"                               # ~/.ssh/config alias or "user@h
 # [hosts.server.envs.custom.env]
 # CACHE_DIR = "/data/your-user/cache"
 
-# --- Host-Level Read-Only Shared Assets (optional) ---
+# --- Host-Level Shared Assets (optional, write access follows host permissions) ---
 # Exposes REMOTE_RUN_SHARED_<ALIAS>_PATH / _VERSION / _SHA256 and {shared.<alias>.*} placeholders (no symlinks).
 # [hosts.server.shared.dataset-v1]
 # path = "/data/your-user/datasets/v1"

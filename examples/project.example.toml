@@ -9,15 +9,15 @@ schema_version = 1
 
 # 2. Workspace Isolation
 # Single-checkout repos default to "default" (keeps build caches across `git checkout -b`).
-# Linked Git worktrees automatically isolate per branch unless overridden here.
+# Linked Git worktrees isolate per checkout unless overridden here.
 # workspace = "default"
 # remote_dir = "/data/your-user/custom"   # Explicit remote dir override (cannot combine with [share].project)
 
 # 3. Sync Policy
 [sync]
-use_gitignore = true                      # Respect local .gitignore rules when uploading
-ignore = ["docs/", "papers/"]             # Local-only paths skipped during upload (never auto-deleted if kept locally)
-# Built-in preserve: .venv, outputs, checkpoints, .cache (never uploaded, never deleted)
+use_gitignore = true                      # Git ignore rules in checkouts, rsync exclude syntax in plain directories
+ignore = ["docs/", "papers/"]             # Paths excluded from upload and default ghost cleanup
+# Built-in workspace-root preserve: .venv, outputs, checkpoints, .cache
 preserve = ["target/", "build/", "reports/"]
 
 # 4. Shared Assets

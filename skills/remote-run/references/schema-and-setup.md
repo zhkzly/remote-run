@@ -25,26 +25,26 @@ ssh = "my-server"    # Required: ~/.ssh/config alias or "user@host" (NO ":port",
 | `path_prepend` | List of remote `/...` or `~/...` dirs prepended to `PATH` (for `~/.bashrc`-guarded tools like `nvm`/`conda` or toolchain overrides) | `[]` (login shell `PATH` inherited automatically unless `REMOTE_RUN_INHERIT_LOGIN_PATH=0`) |
 
 ### Level 2 — Advanced Sections
-- **Resource lock overrides (`[hosts.<name>]`)**:
-  - `locks_dir`: remote `/...` or `~/...` dir (defaults to `<root>/locks`).
-  - `gpu_slot`: identifier override for GPU lock filename (when omitted, CUDA derives sorted `gpu-N` lock(s), e.g., `["gpu-0", "gpu-1"]` for `cuda:0,1`; CPU never acquires GPU locks).
+- **Resource locks (`[hosts.<name>]`)**:
+  - `locks_dir`: owned private remote directory outside workspaces and other control paths. Defaults to `<root>/locks`.
+  - `gpu_slot`: optional legacy lock identifier added to the sorted per-card `gpu-N` locks. CPU jobs skip card locks. Let active jobs using the previous lock rules finish before switching.
   - Tip: Prefer `--no-gpu` or `--device` over duplicating host blocks; only add a `[hosts.desktop_cpu]` alias if you want to pin `host = "desktop_cpu"` inside a project's `.remote-run.toml`.
 - **Named environments (`[hosts.<name>.envs.<env>]`)**:
   - `python`: optional remote path (`/...` or `~/...`) — omit for non-Python toolchains (Rust/Go/Node/C++).
   - `path_prepend`: list of remote `/...` or `~/...` dirs prepended to `PATH`.
   - `[hosts.<name>.envs.<env>.env]`: string map of static env vars (note: `.env` table here vs `[env_vars]` in `.remote-run.toml`).
-- **Host shared read-only assets (`[hosts.<name>.shared.<asset>]`)**:
+- **Host shared assets (`[hosts.<name>.shared.<asset>]`)**:
   - `path` (required, `/...` or `~/...`), `manifest` (optional relative path), `sha256` (optional 64 hex chars), `version` (optional string).
-  - Does **NOT** create symlinks; injects `REMOTE_RUN_SHARED_<ALIAS>_PATH`, `_NAME`, `_VERSION`, `_SHA256` and `{shared.<alias>.*}`.
+  - Injects `REMOTE_RUN_SHARED_<ALIAS>_PATH`, `_NAME`, `_VERSION`, `_SHA256` and `{shared.<alias>.*}`. Linux file permissions govern writes. Aliases must remain unique when converted to uppercase and underscores.
 
-*(Note: `remote-run` automatically uses a private `0700` SSH `ControlMaster` socket under `~/.cache/remote-run/ssh/` so no manual `ControlMaster` edit in `~/.ssh/config` is needed unless disabled via `REMOTE_RUN_SSH_CONTROL=0`.)*
+SSH multiplexing uses the actual endpoint and a private directory under `~/.cache/remote-run/ssh/`. Set `REMOTE_RUN_SSH_CONTROL=0` to disable it. Long socket paths also disable multiplexing. Set `REMOTE_RUN_INHERIT_LOGIN_PATH=0` on the client to disable optional login PATH discovery.
 
 ---
 
 ## 2. Optional Project Config (`<repo_root>/.remote-run.toml`)
 
 Only create when needed. Allowed keys ONLY:
-- **Top-level**: `schema_version = 1`, `project` (fixed folder ID), `host`, `env` (`"venv"`, `"none"`, or host env), `workspace` (overrides auto `default` / worktree-branch naming), `remote_dir` (`/...` or `~/...`; cannot combine with `[share].project`).
+- **Top-level**: `schema_version = 1`, `project` (fixed folder ID), `host`, `env` (`"venv"`, `"none"`, or host env), `workspace` (overrides `default` or linked checkout naming), `remote_dir` (`/...` or `~/...`). A syncing workspace cannot combine `remote_dir` with `[share].project`.
 - **`[sync]`**: `use_gitignore` (bool, default `true`), `ignore` (list), `preserve` (list of relative dirs).
 - **`[share]`**: `project` (relative dirs symlinked across linked worktrees via `projects/<id>/shared/<dir>`), `host` (list of host asset names or `"alias=name"`).
 - **`[env_vars]`**: string map supporting `{run_id}`, `{host}`, `{device}`, `{artifacts}`, `{code}`, `{python}`, `{git_commit}`, `{git_branch}`, `{shared.<alias>.path|version|sha256}` (placeholders expand ONLY here and in `--env-var`).
@@ -52,8 +52,8 @@ Only create when needed. Allowed keys ONLY:
 ### Sync Content Categories
 | Category | Uploaded? | Remote Ghost Cleanup / Delete Protection |
 |---|---|---|
-| Regular source files | Yes | Pruned on rename/delete only if tracked in `.remote-run-synced.json` & absent locally |
-| `.gitignore` + `BUILTIN_IGNORE` + `[sync].ignore` | No | Never deleted if local file still exists |
+| Regular source files | Yes | Default cleanup requires a matching registered remote version and an absent, unignored local path |
+| Git ignores, built-in exclusions and `[sync].ignore` | No | Protected from default cleanup when the current rules match |
 | `BUILTIN_PRESERVE` (`.venv`, `outputs`, `checkpoints`, `.cache`) + `[sync].preserve` | No | Never uploaded and never deleted (`sync --delete` or ghost cleanup) |
 | `[share].project` / `[share].host` | No | `project` symlinked + auto-preserved; `host` env-var/SHA-256 verified only (no symlinks) |
 
@@ -65,6 +65,8 @@ Validate anytime with `remote-run config`.
 
 1. **Expose CLI & MCP binaries** on `PATH` (replace `<repo>` with your clone path):
    ```bash
+   mkdir -p ~/.local/bin
+   export PATH="$HOME/.local/bin:$PATH"
    ln -sf <repo>/bin/remote-run ~/.local/bin/remote-run
    ln -sf <repo>/bin/remote-run-mcp ~/.local/bin/remote-run-mcp
    ```
@@ -82,4 +84,4 @@ Validate anytime with `remote-run config`.
    agy mcp add remote-run ~/.local/bin/remote-run-mcp
    ```
    - **Claude Code note**: Start a **new** Claude Code session after registering the MCP server so `mcp__remote-run__*` tools attach.
-   - **Claude Code read-only allowlist (optional)**: Add `"mcp__remote-run__remote_hosts"`, `"mcp__remote-run__remote_config"`, `"mcp__remote-run__remote_doctor"`, `"mcp__remote-run__remote_status"` to `.claude/settings.json` `permissions.allow`.
+   - **Claude Code read-only allowlist (optional)**: Add `"mcp__remote-run__remote_hosts"`, `"mcp__remote-run__remote_config"`, `"mcp__remote-run__remote_status"` to `.claude/settings.json` `permissions.allow`. Doctor can execute configured probes and should receive its own approval.

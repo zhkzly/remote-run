@@ -1,6 +1,7 @@
 """Unit, worker, local rsync, and MCP stdio protocol tests for remote-run."""
 from hashlib import sha256
 import json
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,26 @@ def git_init_commit(repo: Path, branch: str = "main") -> str:
 
 
 class RemoteRunTests(unittest.TestCase):
+    def setUp(self):
+        fixture = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        ssh = fixture / "ssh"
+        ssh.write_text('#!/bin/sh\nprintf "fixture SSH: %s\\n" "$@" >&2\nexit 1\n')
+        ssh.chmod(0o700)
+        tmux = fixture / "tmux"
+        tmux.write_text("#!/bin/sh\nexit 1\n")
+        tmux.chmod(0o700)
+        self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": str(fixture) + os.pathsep + os.environ["PATH"],
+            "REMOTE_RUN_SSH_CONTROL": "0",
+            "REMOTE_RUN_INHERIT_LOGIN_PATH": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TEMPLATE_DIR": "",
+        }))
+        self.enterContext(mock.patch.object(rr, "workspace_lease", side_effect=lambda *_: nullcontext()))
+        rr.probe_login_path.cache_clear()
+        self.addCleanup(rr.probe_login_path.cache_clear)
+
     def test_symlink_bin_and_mcp_entrypoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "hosts.toml"
@@ -454,11 +475,13 @@ class RemoteRunTests(unittest.TestCase):
             (weird_dir / "request.json").write_text("[]")
             owned_run = r / "runs" / "rr-old-1"
             owned_run.mkdir(parents=True)
+            rr.write_json(owned_run / rr.RUN_MARKER, {"schema_version": 1, "run_id": owned_run.name})
             rr.write_json(owned_run / "request.json", {"host": "h"})
             rr.write_json(owned_run / "state.json", {"run_id": "rr-old-1", "status": "completed"})
             # Dead running run with old mtime: dry-run must preserve mtime & state.json, --apply must delete
             dead_running = r / "runs" / "rr-dead-running"
             dead_running.mkdir(parents=True)
+            rr.write_json(dead_running / rr.RUN_MARKER, {"schema_version": 1, "run_id": dead_running.name})
             rr.write_json(dead_running / "request.json", {"host": "h", "device": "cpu", "workdir": str(r)})
             dead_st = {"run_id": "rr-dead-running", "status": "running", "started_at": "2020-01-01T00:00:00+00:00"}
             rr.write_json(dead_running / "state.json", dead_st)
@@ -668,12 +691,13 @@ class RemoteRunTests(unittest.TestCase):
             other = root / "other"
             other.mkdir()
             (other / ".remote-run.toml").write_text('schema_version = 1\nhost = "secondary"\n')
-            # Trigger status --repo -> fails trying to SSH s2 (not s1!)
+            # Verify the selected host through the local SSH fixture.
             proc = subprocess.run(
                 [sys.executable, "-B", str(ROOT / "remote_run.py"), "--config", str(cfg), "status", "--repo", str(other)],
                 capture_output=True, text=True,
             )
             self.assertEqual(proc.returncode, 1)
+            self.assertIn("fixture SSH: s2", proc.stderr)
 
     def test_mcp_stdio_protocol_hardening(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -938,24 +962,24 @@ class RemoteRunTests(unittest.TestCase):
     def test_ssh_control_master_rsync_fallback_and_init_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            fake_home = base / "home"
-            fake_home.mkdir()
+            cache_dir = base / "ssh"
             host = {"ssh": "box", "port": 2222}
-            with mock.patch.object(rr.Path, "home", return_value=fake_home), \
+            with mock.patch.object(rr, "local_cache_dir", return_value=cache_dir), \
                  mock.patch.dict(os.environ, {"REMOTE_RUN_SSH_CONTROL": "1"}):
                 argv = rr.build_ssh_argv(host)
                 self.assertIn("ControlMaster=auto", argv)
                 self.assertIn("ControlPersist=60", argv)
                 self.assertIn("-p", argv)
                 self.assertIn("2222", argv)
-                self.assertEqual((fake_home / ".cache" / "remote-run" / "ssh").stat().st_mode & 0o777, 0o700)
+                self.assertEqual(cache_dir.stat().st_mode & 0o777, 0o700)
+                self.assertTrue(any("%C" in argument for argument in argv))
             with mock.patch.dict(os.environ, {"REMOTE_RUN_SSH_CONTROL": "0"}):
                 argv_off = rr.build_ssh_argv(host)
                 self.assertNotIn("ControlMaster=auto", argv_off)
 
             # macOS rsync fallback (no --protect-args)
             rr.rsync_supports_protect_args.cache_clear()
-            with mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(stdout="rsync 2.6.9", stderr="")):
+            with mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="rsync 2.6.9", stderr="")):
                 self.assertEqual(rr.rsync_protect_args(), [])
                 self.assertEqual(rr.rsync_remote_spec("box", "/tmp/dir with space"), "box:'/tmp/dir with space/'")
             rr.rsync_supports_protect_args.cache_clear()
@@ -1075,7 +1099,7 @@ class RemoteRunTests(unittest.TestCase):
                 "files": ["outputs/res.txt", rr.WORKSPACE_MARKER, "../secret.txt", "sym_link"],
             })
             rec = rr.reconcile_synced_manifest(
-                remote_root, str(wdir), [], ["outputs/res.txt", rr.WORKSPACE_MARKER, "../secret.txt", "sym_link"], rr.BUILTIN_PRESERVE,
+                remote_root, str(wdir), {}, ["outputs/res.txt", rr.WORKSPACE_MARKER, "../secret.txt", "sym_link"], rr.BUILTIN_PRESERVE,
             )
             self.assertEqual(rec["pruned_ghost_files"], [])
             self.assertTrue(outside.is_file())
@@ -1170,6 +1194,7 @@ class RemoteRunTests(unittest.TestCase):
             for i in range(400):
                 jd = runs_dir / f"rr-term-{i:04d}"
                 jd.mkdir()
+                rr.write_json(jd / rr.RUN_MARKER, {"schema_version": 1, "run_id": jd.name})
                 rr.write_json(jd / "request.json", {"host": "h", "device": "cpu", "workdir": str(ws_dir)})
                 rr.write_json(jd / "state.json", {"run_id": jd.name, "status": "completed"})
             for j in range(1000):
@@ -1181,11 +1206,13 @@ class RemoteRunTests(unittest.TestCase):
             self.assertEqual(active, [])
             self.assertLess(t_active, 2.0)
 
-            # Prune runs WITHOUT acquiring submit.lock and returns workspace paths without bytes rglob
+            # Prune skips busy directories, then removes them after submit releases its lock.
             with mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")):
-                with (root / "submit.lock").open("a") as lock:
+                with rr.open_lock(root / "submit.lock") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
-                    p_res = rr.control({"action": "prune", "host": host, "days": 0.0, "apply": True})
+                    busy = rr.control({"action": "prune", "host": host, "days": 0.0, "apply": True})
+                    self.assertEqual(busy["runs_count"], 0)
+                p_res = rr.control({"action": "prune", "host": host, "days": 0.0, "apply": True})
             self.assertEqual(p_res["runs_count"], 400)
             self.assertEqual(p_res["workspaces"], [{"path": str(ws_dir)}])
 
