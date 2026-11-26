@@ -675,6 +675,7 @@ class RemoteRunTests(unittest.TestCase):
             self.assertEqual(by_id[1]["result"]["serverInfo"]["version"], "0.4.0")
             tools = {t["name"]: t for t in by_id[2]["result"]["tools"]}
             self.assertIn("remote_prune", tools)
+            self.assertIn("repo", tools["remote_doctor"]["inputSchema"]["properties"])
             self.assertIn("paths_only", tools["remote_pull"]["inputSchema"]["properties"])
             self.assertIn("annotations", tools["remote_exec"])
             self.assertTrue(tools["remote_exec"]["annotations"]["destructiveHint"])
@@ -794,6 +795,41 @@ class RemoteRunTests(unittest.TestCase):
             self.assertNotEqual((wdir / "out_dir").stat().st_mode & 0o777, 0o700)
             self.assertEqual((r / "sessions").stat().st_mode & 0o777, 0o700)
             self.assertEqual((r / "sessions" / f"{skey}.json").stat().st_mode & 0o777, 0o600)
+
+            # 5. doctor --repo infers host, env, and [share].host from another cwd; --host override ignores cwd defaults
+            cfg = base / "doc_hosts.toml"
+            cfg.write_text(
+                f'schema_version = 1\ndefault_host = "other"\n'
+                f'[hosts.primary]\nssh = "s1"\nroot = "{r}"\ndefault_env = "venv"\n'
+                f'[hosts.primary.envs.pytorch]\npython = "{sys.executable}"\n'
+                f'[hosts.primary.shared.ds]\npath = "{r / "ds"}"\n'
+                f'[hosts.other]\nssh = "s2"\nroot = "{r}"\n'
+            )
+            doc_repo = base / "doc_repo"
+            doc_repo.mkdir()
+            (doc_repo / ".remote-run.toml").write_text(
+                'schema_version = 1\nhost = "primary"\nenv = "pytorch"\n[share]\nhost = ["data=ds"]\n'
+            )
+            with mock.patch.object(rr.Path, "cwd", return_value=Path.home()):
+                with mock.patch.object(rr, "ssh_call", return_value={"status": "ready"}) as mssh:
+                    with mock.patch.object(sys, "argv", [
+                        "remote-run", "--config", str(cfg), "doctor", "--repo", str(doc_repo),
+                    ]):
+                        d_out, _, _ = rr.cli()
+            self.assertEqual(d_out["status"], "ready")
+            self.assertEqual(mssh.call_args.args[0]["name"], "primary")
+            self.assertEqual(mssh.call_args.args[2]["env_name"], "pytorch")
+            self.assertEqual(mssh.call_args.args[2]["shared"]["data"]["path"], str(r / "ds"))
+
+            with mock.patch.object(rr.Path, "cwd", return_value=doc_repo):
+                with mock.patch.object(rr, "ssh_call", return_value={"status": "ready"}) as mssh:
+                    with mock.patch.object(sys, "argv", [
+                        "remote-run", "--config", str(cfg), "doctor", "--host", "other",
+                    ]):
+                        d_other, _, _ = rr.cli()
+            self.assertEqual(d_other["status"], "ready")
+            self.assertEqual(mssh.call_args.args[0]["name"], "other")
+            self.assertEqual(mssh.call_args.args[2]["shared"], {})
 
 
 if __name__ == "__main__":

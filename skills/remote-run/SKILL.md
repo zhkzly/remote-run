@@ -24,9 +24,10 @@ Local editing and quick checks stay on the laptop. Use the `remote-run` CLI (or 
 
 1. **Discover hosts, inspect effective config, & check readiness**:
    ```bash
-   remote-run hosts --pretty
+   remote-run hosts                               # compact JSON (avoid piping JSON to head)
    remote-run config                              # inspect effective_ignore, effective_preserve, remote workdir
-   remote-run doctor                              # returns host, env, GPU details, python
+   remote-run doctor                              # checks host, env, GPU, and project [share].host
+   remote-run doctor --repo . --check-cuda        # infer host, env, and [share].host from repo
    remote-run doctor --env venv                   # check host tools without requiring host python
    remote-run doctor --check-import torch --check-cuda
    ```

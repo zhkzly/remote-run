@@ -1725,6 +1725,7 @@ def cli():
     cfg_p.add_argument("--workspace", default="", help="Explicit remote workspace ID override")
 
     doc_p = sub.add_parser("doctor", parents=[common], help="Verify SSH, git/tmux/rsync, GPU, Python env, and shared assets")
+    doc_p.add_argument("--repo", type=Path, default=None, help="Local project path to infer host, env, and [share].host from .remote-run.toml")
     doc_p.add_argument("--env", default="", help="Environment name from host config (or 'venv' / 'none')")
     doc_p.add_argument("--shared", action="append", default=[], help="Host shared asset name to verify (repeatable)")
     doc_p.add_argument("--check-import", action="append", default=[], help="Python module to test importing (repeatable)")
@@ -1868,9 +1869,18 @@ def cli():
     host = select_host(config_path, cli_host or (cwd_proj["host"] if cwd_proj else None) or None)
 
     if args.action == "doctor":
-        env_name = args.env or (cwd_proj["env"] if cwd_proj else "") or host["default_env"]
+        if args.repo is not None:
+            rr_root, _, _ = resolve_repo_context(args.repo)
+            doc_proj = load_project_config(rr_root)
+            host = select_host(config_path, cli_host or doc_proj["host"] or None)
+            use_proj_defaults = True
+        else:
+            doc_proj = cwd_proj
+            use_proj_defaults = bool(doc_proj and (not cli_host or not doc_proj["host"] or cli_host == doc_proj["host"]))
+        env_name = args.env or (doc_proj["env"] if use_proj_defaults else "") or host["default_env"]
         env_cfg = resolve_env(host, env_name)
-        shared = resolve_shared_bindings(host, args.shared)
+        shared_specs = (list(doc_proj["share"]["host"]) if use_proj_defaults else []) + list(args.shared)
+        shared = resolve_shared_bindings(host, shared_specs)
         return ssh_call(host, "doctor", {
             "env_name": env_cfg["name"],
             "python": env_cfg["python"],

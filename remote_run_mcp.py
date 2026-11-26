@@ -45,6 +45,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "repo": {"type": "string", "description": "Optional local project dir to infer host, env, and [share].host from .remote-run.toml"},
                 "host": {"type": "string", "description": "Optional host name override"},
                 "env": {"type": "string", "description": "Environment name to probe (or 'venv' / 'none')"},
                 "shared": {"type": "array", "items": {"type": "string"}, "description": "Host shared asset names to verify"},
@@ -238,6 +239,8 @@ def call_tool(name, a):
         return run_cli(argv)
     if name == "remote_doctor":
         argv = [*common_flags(a), "doctor"]
+        if a.get("repo") is not None:
+            argv.extend(["--repo", str(a["repo"])])
         if a.get("env") is not None:
             argv.extend(["--env", str(a["env"])])
         for s in (a.get("shared") or []):

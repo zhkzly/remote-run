@@ -47,6 +47,8 @@ Validate anytime with `remote-run config`.
 3. **Register Stdio MCP Server** (optional; gives native `remote_*` structured tools):
    ```bash
    codex mcp add remote-run -- remote-run-mcp
-   claude mcp add remote-run -- remote-run-mcp
-   agy mcp add remote-run remote-run-mcp
+   claude mcp add -s user remote-run -- remote-run-mcp
+   agy mcp add remote-run ~/.local/bin/remote-run-mcp
    ```
+   - **Claude Code note**: Start a **new** Claude Code session after registering the MCP server so `mcp__remote-run__*` tools attach (resumed sessions hot-reload `SKILL.md` but not newly added MCP servers).
+   - **Claude Code read-only allowlist (optional)**: Add `"mcp__remote-run__remote_hosts"`, `"mcp__remote-run__remote_config"`, `"mcp__remote-run__remote_doctor"`, `"mcp__remote-run__remote_status"` to `.claude/settings.json` `permissions.allow` to skip prompts and avoid `auto`-mode classifier stalls on read-only checks.
