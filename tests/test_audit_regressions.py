@@ -1,7 +1,10 @@
 """Focused regressions for the release audit."""
+import grp
 from hashlib import sha256
 import io
+import os
 from pathlib import Path
+import pwd
 import shlex
 import sys
 import tempfile
@@ -203,3 +206,66 @@ class AuditRegressions(unittest.TestCase):
             self.assertFalse(acquired_while_held)
             self.assertTrue(locked.is_set())
             self.assertFalse(contender.is_alive())
+
+    def test_directory_chain_allows_user_private_group_and_rejects_shared_writable(self):
+        pw_self = SimpleNamespace(pw_name="alice", pw_uid=1000, pw_gid=1000)
+        pw_other_diff_gid = SimpleNamespace(pw_name="bob", pw_uid=1001, pw_gid=1001)
+        pw_other_same_gid = SimpleNamespace(pw_name="charlie", pw_uid=1002, pw_gid=1000)
+        gr_upg = SimpleNamespace(gr_name="alice", gr_mem=[])
+        gr_shared_name = SimpleNamespace(gr_name="users", gr_mem=[])
+        gr_extra_mem = SimpleNamespace(gr_name="alice", gr_mem=["bob"])
+
+        rr.is_single_user_group.cache_clear()
+        try:
+            with mock.patch.object(pwd, "getpwuid", return_value=pw_self), \
+                 mock.patch.object(grp, "getgrgid", return_value=gr_upg), \
+                 mock.patch.object(pwd, "getpwall", return_value=[pw_self, pw_other_diff_gid]):
+                self.assertTrue(rr.is_single_user_group(1000, 1000))
+            rr.is_single_user_group.cache_clear()
+            with mock.patch.object(pwd, "getpwuid", return_value=pw_self), \
+                 mock.patch.object(grp, "getgrgid", return_value=gr_shared_name), \
+                 mock.patch.object(pwd, "getpwall", return_value=[pw_self]):
+                self.assertFalse(rr.is_single_user_group(1000, 1000))
+            rr.is_single_user_group.cache_clear()
+            with mock.patch.object(pwd, "getpwuid", return_value=pw_self), \
+                 mock.patch.object(grp, "getgrgid", return_value=gr_extra_mem), \
+                 mock.patch.object(pwd, "getpwall", return_value=[pw_self]):
+                self.assertFalse(rr.is_single_user_group(1000, 1000))
+            rr.is_single_user_group.cache_clear()
+            with mock.patch.object(pwd, "getpwuid", return_value=pw_self), \
+                 mock.patch.object(grp, "getgrgid", return_value=gr_upg), \
+                 mock.patch.object(pwd, "getpwall", return_value=[pw_self, pw_other_same_gid]):
+                self.assertFalse(rr.is_single_user_group(1000, 1000))
+        finally:
+            rr.is_single_user_group.cache_clear()
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            os.chmod(base, 0o755)  # Prevent TemporaryDirectory's 0700 from short-circuiting private_parent
+            home_dir = base / "home"
+            home_dir.mkdir()
+            os.chmod(home_dir, 0o750)
+            local_share = home_dir / ".local" / "share" / "remote-run"
+            local_share.mkdir(parents=True)
+            for p in (home_dir / ".local", home_dir / ".local" / "share"):
+                os.chmod(p, 0o775)
+            os.chmod(local_share, 0o700)
+
+            with mock.patch.object(rr, "is_single_user_group", return_value=True):
+                rr.check_directory_chain(local_share, "Remote root", trusted=True)
+
+            with mock.patch.object(rr, "is_single_user_group", return_value=False):
+                with self.assertRaisesRegex(ValueError, "writable by another user"):
+                    rr.check_directory_chain(local_share, "Remote root", trusted=True)
+
+            # Non-sticky world-writable ancestor fails with actionable chmod +t hint; sticky passes
+            mount = base / "shared_mount"
+            mount.mkdir()
+            sub = mount / "jobs"
+            sub.mkdir()
+            os.chmod(sub, 0o700)
+            os.chmod(mount, 0o777)
+            with self.assertRaisesRegex(ValueError, "chmod \\+t"):
+                rr.check_directory_chain(sub, "Remote root", trusted=True)
+            os.chmod(mount, 0o1777)
+            rr.check_directory_chain(sub, "Remote root", trusted=True)

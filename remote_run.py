@@ -9,12 +9,14 @@ import errno
 import fcntl
 from fnmatch import fnmatchcase
 import functools
+import grp
 import hashlib
 from hashlib import sha256
 import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
 import select
 import shlex
@@ -245,7 +247,26 @@ def write_private_text(path, value):
         temp.unlink(missing_ok=True)
 
 
+@functools.lru_cache(maxsize=16)
+def is_single_user_group(gid, euid):
+    try:
+        pw = pwd.getpwuid(euid)
+        gr = grp.getgrgid(gid)
+    except (KeyError, OSError):
+        return False
+    if pw.pw_gid != gid or gr.gr_name != pw.pw_name:
+        return False
+    if any(member != pw.pw_name for member in gr.gr_mem):
+        return False
+    try:
+        entries = pwd.getpwall()
+    except OSError:
+        return False
+    return all(entry.pw_uid == euid for entry in entries if entry.pw_gid == gid)
+
+
 def check_directory_chain(path, label, *, trusted=False):
+    euid = os.geteuid()
     admin_uid = Path(path.anchor).stat().st_uid if trusted else None
     private_parent = False
     for part in (*reversed(path.parents), path):
@@ -255,10 +276,23 @@ def check_directory_chain(path, label, *, trusted=False):
             continue
         if not stat.S_ISDIR(info.st_mode):
             raise ValueError(f"{label} includes a symlink or non-directory: {part}")
-        if trusted and not private_parent and (info.st_uid not in (0, admin_uid, os.geteuid()) or
-                        (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
-            raise ValueError(f"{label} includes a directory writable by another user: {part}")
-        private_parent |= info.st_uid == os.geteuid() and not info.st_mode & 0o011
+        if trusted and not private_parent:
+            sticky = bool(info.st_mode & stat.S_ISVTX)
+            bad_owner = info.st_uid not in (0, admin_uid, euid)
+            world_writable = bool(info.st_mode & 0o002) and not sticky
+            group_writable = bool(info.st_mode & 0o020) and not sticky and not (
+                info.st_uid == euid and is_single_user_group(info.st_gid, euid)
+            )
+            if bad_owner or world_writable or group_writable:
+                raise ValueError(
+                    f"{label} includes a directory writable by another user: {part} "
+                    f"(fix permissions, e.g. `chmod +t {part}` on a shared mount, or choose a root under your home directory)"
+                )
+        private_parent |= (
+            info.st_uid == euid
+            and not (info.st_mode & 0o001)
+            and (not (info.st_mode & 0o010) or is_single_user_group(info.st_gid, euid))
+        )
 
 
 def private_directory(path, *, create=True, tighten=True):

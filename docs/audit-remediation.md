@@ -71,3 +71,7 @@
 第二位审查者检查了实现、测试、双语 README、使用手册、配置示例和 Skill。复核发现的相交路径、锁连接监控、PID 身份、私有路径、清理隔离、Git 忽略和文档边界问题已回填。对最终差异复核后，审查者同意交付本地修复。
 
 本地 `python3 -B -m unittest discover -s tests -v` 通过 32 项。两入口的 Bash 语法、示例主机配置、CLI 本地配置检查和 `git diff --check` 均通过。
+
+### 实机 SSH 复核与 UPG 权限修复
+
+对真实 Ubuntu SSH 主机只读探测 `doctor` 时发现：标准 Ubuntu `umask 0002` 下用户主目录（`0750`）与 `~/.local/share`（`0775`，单人私有主组 UPG）会被 `check_directory_chain` 误判为他写，而无 sticky bit 的 `0777` 共享挂载盘提示不够明确。现已通过 `is_single_user_group()` 放行严格核验的单人私有主组 `0750`/`0775` 目录链路，并为非 sticky 他写目录补充 `chmod +t` 或主目录迁移提示；本地 33 项回归与实机只读 Ubuntu SSH `doctor` 均已验证通过。
