@@ -269,3 +269,57 @@ class AuditRegressions(unittest.TestCase):
                 rr.check_directory_chain(sub, "Remote root", trusted=True)
             os.chmod(mount, 0o1777)
             rr.check_directory_chain(sub, "Remote root", trusted=True)
+
+    def test_queued_gpu_lock_reports_blocking_runs_and_queue_next_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "remote"
+            runs = root / "runs"
+            holder = runs / "rr-holder"
+            waiter = runs / "rr-waiter"
+            holder.mkdir(parents=True)
+            waiter.mkdir(parents=True)
+            rr.write_json(holder / "request.json", {
+                "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
+                "use_gpu": True, "gpu_slots": ["gpu-0"], "workdir": str(root / "w1"),
+            })
+            rr.write_json(holder / "state.json", {
+                "run_id": "rr-holder", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
+            rr.write_json(waiter / "request.json", {
+                "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
+                "use_gpu": True, "gpu_slots": ["gpu-0"], "workdir": str(root / "w2"),
+            })
+            rr.write_json(waiter / "state.json", {
+                "run_id": "rr-waiter", "status": "queued", "waiting_for_lock": True,
+                "worker_pid": os.getpid(), "submitted_at": rr.now(),
+            })
+            with mock.patch.object(rr, "run_process_alive", return_value=True):
+                st = rr.state_of(waiter, root)
+            self.assertEqual(st["blocked_by_runs"], ["rr-holder"])
+            msg = rr.continuation({"name": "desktop"}, "rr-waiter", state=st)
+            self.assertIn("Queued waiting for GPU lock", msg)
+            self.assertIn("rr-holder", msg)
+
+    def test_failed_submit_does_not_print_ghost_run_banner_to_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            args = SimpleNamespace(
+                shell="echo hi", command=[], wait=15.0, tail_bytes=8192, raw_log=False,
+                follow=False, no_sync=True, no_project=False, _no_project_mode=False,
+                _in_git=False, remote_dir="", workspace="", env="", shared=[], env_var=[],
+                device="", no_gpu=True, session="", run_id="rr-ghost-check", _config_path=None,
+            )
+            host = {
+                "name": "desktop", "ssh": "unused", "root": str(Path(directory) / "remote"),
+                "locks_dir": str(Path(directory) / "remote/locks"), "device": "cpu",
+                "default_env": "", "path_prepend": [], "envs": {}, "shared": {},
+            }
+            stderr = io.StringIO()
+            with mock.patch.object(rr, "workspace_lease", return_value=mock.MagicMock(__enter__=lambda s: None, __exit__=lambda *a: False)), \
+                 mock.patch.object(rr, "ssh_call", side_effect=RuntimeError("No remote workspace")), \
+                 mock.patch.object(sys, "stderr", stderr):
+                with self.assertRaisesRegex(RuntimeError, "No remote workspace"):
+                    rr.handle_exec(args, host, repo, "", rr.empty_project_config())
+            self.assertEqual(stderr.getvalue(), "")

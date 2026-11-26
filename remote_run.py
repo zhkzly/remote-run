@@ -1052,6 +1052,39 @@ def ensure_root_owned(root, *, init_root=False, dry_run=False):
     write_json(marker, {"schema_version": 1, "created_at": now()})
 
 
+def queue_holder_runs(root, job, req):
+    if not req.get("use_gpu"):
+        return []
+    wanted = set(req.get("gpu_slots") or [])
+    if not wanted:
+        return []
+    runs_dir = root / "runs"
+    if not runs_dir.is_dir():
+        return []
+    holders = []
+    for child in sorted(runs_dir.iterdir()):
+        if child.name == job.name or not child.is_dir() or child.is_symlink():
+            continue
+        if not (child / "state.json").is_file() or not (child / "request.json").is_file():
+            continue
+        try:
+            other_req = read_json(child / "request.json")
+            if not isinstance(other_req, dict) or not other_req.get("use_gpu"):
+                continue
+            other_slots = set(other_req.get("gpu_slots") or [])
+            if not (wanted & other_slots):
+                continue
+            other_state = read_json(child / "state.json")
+            if not isinstance(other_state, dict) or other_state.get("status") != "running":
+                continue
+            if not run_process_alive(other_state):
+                continue
+            holders.append(child.name)
+        except (ValueError, KeyError, OSError):
+            continue
+    return holders
+
+
 def state_of(job, root):
     state_path = job / "state.json"
     request_path = job / "request.json"
@@ -1087,7 +1120,7 @@ def state_of(job, root):
         t0 = datetime.fromisoformat(state["started_at"])
         t1 = datetime.fromisoformat(state["finished_at"]) if state.get("finished_at") else datetime.now(timezone.utc)
         elapsed = round(max(0.0, (t1 - t0).total_seconds()), 3)
-    return {
+    out = {
         **state,
         "host": req["host"],
         "device": "cpu" if req.get("use_gpu") is False else req["device"],
@@ -1101,6 +1134,11 @@ def state_of(job, root):
         "tmux_session": t_session,
         "elapsed_sec": elapsed,
     }
+    if out.get("status") == "queued" and out.get("waiting_for_lock"):
+        holders = queue_holder_runs(root, job, req)
+        if holders:
+            out["blocked_by_runs"] = holders
+    return out
 
 
 def run_process_alive(state):
@@ -2653,14 +2691,21 @@ def sync_workspace(repo_root, proj_cfg, host, ws_info, *, run_id="", delete=Fals
         return res
 
 
-def continuation(host, run_id, config_path=None):
+def continuation(host, run_id, config_path=None, *, state=None):
     prefix = ["remote-run"]
     if config_path is not None:
         prefix.extend(["--config", str(config_path.absolute())])
     prefix.extend(["--host", host["name"]])
     status = shlex.join([*prefix, "status", run_id, "--wait", "30"])
     cancel = shlex.join([*prefix, "cancel", run_id])
-    return f"Check with `{status}` or cancel with `{cancel}`"
+    base = f"Check with `{status}` or cancel with `{cancel}`"
+    if isinstance(state, dict) and state.get("status") == "queued" and state.get("waiting_for_lock"):
+        holders = state.get("blocked_by_runs") or []
+        if holders:
+            holder_str = ", ".join(holders)
+            return f"Queued waiting for GPU lock (currently held by {holder_str}); it will start automatically once free. {base}"
+        return f"Queued waiting for GPU lock; it will start automatically once free. {base}"
+    return base
 
 
 def wait_for_status(host, run_id, wait_sec, *, offset=None, tail_bytes=8192, raw_log=False, config_path=None):
@@ -2681,7 +2726,7 @@ def wait_for_status(host, run_id, wait_sec, *, offset=None, tail_bytes=8192, raw
     )
     res["detached"] = res["status"] not in TERMINAL
     if res["detached"]:
-        res["next_action"] = continuation(host, run_id, config_path)
+        res["next_action"] = continuation(host, run_id, config_path, state=res)
     return res
 
 
@@ -2868,7 +2913,7 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("rr-%Y%m%dT%H%M%S-") + uuid4().hex[:8]
     resume = continuation(host, run_id, getattr(args, "_config_path", None))
-    print(f"remote-run: run {run_id} on {host['name']}. {resume}", file=sys.stderr, flush=True)
+    submitted = False
     try:
         with workspace_lease(host, ws_info["workdir"]) as lease:
             rpc = {"lease": lease} if lease is not None else {}
@@ -2925,6 +2970,8 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
             if os.environ.get("REMOTE_RUN_INHERIT_LOGIN_PATH", "1") == "0":
                 request["inherit_login_path"] = False
             receipt = ssh_call(host, "submit", {"run_id": run_id, "request": request}, **rpc)
+            submitted = True
+            print(f"remote-run: run {run_id} on {host['name']}. {resume}", file=sys.stderr, flush=True)
         if args.follow:
             out = follow_run(host, run_id, raw_log=args.raw_log)
         elif args.wait > 0:
@@ -2935,13 +2982,16 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         else:
             out = receipt
     except KeyboardInterrupt:
-        print(f"\nremote-run: stopped local wait for {run_id}. {resume}", file=sys.stderr)
+        if submitted:
+            print(f"\nremote-run: stopped local wait for {run_id}. {resume}", file=sys.stderr)
+        else:
+            print("\nremote-run: interrupted before job submission completed.", file=sys.stderr)
         raise SystemExit(130)
 
     out["reused"] = receipt.get("reused", False)
     out["detached"] = out["status"] not in TERMINAL
     if out["detached"]:
-        out["next_action"] = continuation(host, run_id, getattr(args, "_config_path", None))
+        out["next_action"] = continuation(host, run_id, getattr(args, "_config_path", None), state=out)
     if active_warning:
         out["active_runs_warning"] = active_warning
     if out["status"] in ("failed", "interrupted", "cancelled"):

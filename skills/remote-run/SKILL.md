@@ -71,6 +71,7 @@ Local editing stays on the laptop. When `remote_*` MCP tools are already loaded 
 
 4. **Monitor, attach, cancel, pull, and prune**:
    - Run statuses: `queued`, `running`, and terminal states `completed`, `failed`, `cancelled`, `interrupted`.
+   - When `status == "queued"` and `waiting_for_lock == true`, the run is already queued behind another GPU job (`blocked_by_runs` lists the active holder run IDs when known) and will start automatically once the lock is released — wait via `status RUN_ID --wait ...` instead of cancelling or resubmitting.
    - When `detached: true`, immediately report `run_id`, `host`, `device`, `workdir`, `tmux_session`, and `next_action`.
    - For long jobs in background-capable harnesses, run `remote-run status RUN_ID --wait 3600` in the background (or `remote-run status RUN_ID --follow` in interactive CLI). When polling manually, pass `--offset <next_offset>`.
    ```bash
