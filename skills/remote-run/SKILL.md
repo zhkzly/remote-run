@@ -34,7 +34,7 @@ Local editing stays on the laptop. Use the `remote-run` CLI (or `remote_*` MCP t
    remote-run doctor --repo . --check-cmd cargo
    remote-run doctor --repo . --check-cuda --check-import torch
    ```
-   - `PATH` on the remote host automatically includes `host.path_prepend`, env `path_prepend`, and any existing `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `/usr/local/go/bin`.
+   - Remote `PATH` automatically inherits the remote login shell `PATH` (set `REMOTE_RUN_INHERIT_LOGIN_PATH=0` to disable), so user-installed tools work out of the box; explicit `path_prepend` and env `path_prepend` take highest priority.
 
 2. **Run commands on the remote host**:
    - `exec` is **stateless by default** (isolated `tmux` + PGID, auto-detaches if longer than `--wait`, default `15`s).

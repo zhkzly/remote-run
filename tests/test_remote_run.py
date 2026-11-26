@@ -3,6 +3,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -896,14 +897,18 @@ class RemoteRunTests(unittest.TestCase):
                 p.write_text("#!/bin/sh\nexit 0\n")
                 p.chmod(0o755)
             host = {"name": "h", "root": str(r), "locks_dir": str(r / "locks"), "device": "cpu", "path_prepend": [str(bin_dir)]}
-            with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
-                doc_ok = rr.control({"action": "doctor", "host": host, "env_name": "none", "python": "", "check_cmds": ["g++"]})
-                self.assertEqual(doc_ok["status"], "ready")
-                self.assertEqual(doc_ok["commands"]["g++"], str(tool))
-                doc_miss = rr.control({"action": "doctor", "host": host, "env_name": "none", "python": "", "check_cmds": ["g++", "nonexistent_tool_xyz"]})
-                self.assertEqual(doc_miss["status"], "missing_commands")
-                self.assertTrue(doc_miss["_exec_failed"])
-                self.assertEqual(doc_miss["missing_commands"], ["nonexistent_tool_xyz"])
+            rr.probe_login_path.cache_clear()
+            try:
+                with mock.patch.dict(os.environ, {"PATH": str(fake_bin), "REMOTE_RUN_INHERIT_LOGIN_PATH": "0"}, clear=False):
+                    doc_ok = rr.control({"action": "doctor", "host": host, "env_name": "none", "python": "", "check_cmds": ["g++"]})
+                    self.assertEqual(doc_ok["status"], "ready")
+                    self.assertEqual(doc_ok["commands"]["g++"], str(tool))
+                    doc_miss = rr.control({"action": "doctor", "host": host, "env_name": "none", "python": "", "check_cmds": ["g++", "nonexistent_tool_xyz"]})
+                    self.assertEqual(doc_miss["status"], "missing_commands")
+                    self.assertTrue(doc_miss["_exec_failed"])
+                    self.assertEqual(doc_miss["missing_commands"], ["nonexistent_tool_xyz"])
+            finally:
+                rr.probe_login_path.cache_clear()
 
             # CPU worker does NOT inject CUDA_VISIBLE_DEVICES or CUBLAS_WORKSPACE_CONFIG, and runs/ is 0700
             job = r / "runs" / "rr-cpu-clean"
@@ -1229,6 +1234,64 @@ class RemoteRunTests(unittest.TestCase):
             self.assertTrue(all(not resps[k]["result"]["isError"] for k in range(100, 116)))
             self.assertTrue(resps[200]["result"]["isError"])
             self.assertTrue(resps[201]["result"]["isError"])
+
+    def test_login_path_probe_and_example_toml_templates(self):
+        # 1. probe_login_path extracts PATH cleanly across MOTD noise, respects opt-out, and keeps prepend highest priority
+        rr.probe_login_path.cache_clear()
+        try:
+            motd_out = "Welcome to Ubuntu!\n__RR_LOGIN_PATH_START__/home/u/.cargo/bin:/usr/local/bin__RR_LOGIN_PATH_END__\nbye\n"
+            with mock.patch.dict(os.environ, {"REMOTE_RUN_INHERIT_LOGIN_PATH": "1", "SHELL": "/bin/bash"}), \
+                 mock.patch.object(rr.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=motd_out)):
+                self.assertEqual(rr.probe_login_path(), "/home/u/.cargo/bin:/usr/local/bin")
+                built = rr.build_remote_path("/usr/bin:/bin", ["/opt/custom/bin"])
+                self.assertEqual(built, "/opt/custom/bin:/home/u/.cargo/bin:/usr/local/bin:/usr/bin:/bin")
+                built_static = rr.build_remote_path("/opt/env/bin:/usr/bin", ["/opt/pre/bin"], prefer_base=True)
+                self.assertEqual(built_static, "/opt/pre/bin:/opt/env/bin:/usr/bin:/home/u/.cargo/bin:/usr/local/bin")
+
+            rr.probe_login_path.cache_clear()
+            with mock.patch.dict(os.environ, {"REMOTE_RUN_INHERIT_LOGIN_PATH": "1"}), \
+                 mock.patch.object(rr.subprocess, "run", side_effect=subprocess.TimeoutExpired("bash", 2)):
+                self.assertEqual(rr.probe_login_path(), "")
+
+            rr.probe_login_path.cache_clear()
+            with mock.patch.dict(os.environ, {"REMOTE_RUN_INHERIT_LOGIN_PATH": "0"}):
+                self.assertEqual(rr.probe_login_path(), "")
+        finally:
+            rr.probe_login_path.cache_clear()
+
+        # 2. examples/hosts.example.toml and examples/project.example.toml must validate both as-is AND when all commented fields are uncommented
+        hosts_ex = ROOT / "examples" / "hosts.example.toml"
+        dh, hs = rr.load_hosts_config(hosts_ex)
+        self.assertEqual(dh, "server")
+        self.assertIn("server", hs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            uncommented_lines = []
+            for line in hosts_ex.read_text().splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith("# "):
+                    body = stripped[2:]
+                    if re.match(r"^(?:[a-z_]+\s*=|\[hosts\.)", body):
+                        uncommented_lines.append(body)
+                        continue
+                uncommented_lines.append(line)
+            full_hosts = base / "full_hosts.toml"
+            full_hosts.write_text("\n".join(uncommented_lines) + "\n")
+            dh_full, hs_full = rr.load_hosts_config(full_hosts)
+            self.assertEqual(dh_full, "server")
+            self.assertEqual(hs_full["server"]["port"], 22)
+            self.assertEqual(hs_full["server"]["device"], "cuda:0")
+            self.assertEqual(hs_full["server"]["locks_dir"], "/data/your-user/remote-locks")
+            self.assertIn("custom", hs_full["server"]["envs"])
+            self.assertIn("dataset-v1", hs_full["server"]["shared"])
+
+            proj_repo = base / "proj"
+            proj_repo.mkdir()
+            (proj_repo / ".remote-run.toml").write_text((ROOT / "examples" / "project.example.toml").read_text())
+            pc = rr.load_project_config(proj_repo)
+            self.assertTrue(pc["present"])
+            self.assertEqual(pc["sync"]["preserve"], ["target", "build", "reports"])
 
 
 if __name__ == "__main__":

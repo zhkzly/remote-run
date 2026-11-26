@@ -252,24 +252,57 @@ def build_ssh_argv(host):
     return argv
 
 
-def build_remote_path(base_path, prepend_dirs=()):
+@functools.lru_cache(maxsize=1)
+def probe_login_path():
+    if os.environ.get("REMOTE_RUN_INHERIT_LOGIN_PATH", "1") == "0":
+        return ""
+    shell_env = os.environ.get("SHELL", "")
+    if shell_env and Path(shell_env).is_file() and Path(shell_env).name in ("bash", "zsh", "sh", "dash", "ksh"):
+        shell_bin = shell_env
+    else:
+        shell_bin = shutil.which("bash") or "/bin/sh"
+    start_tag, end_tag = "__RR_LOGIN_PATH_START__", "__RR_LOGIN_PATH_END__"
+    cmd = [shell_bin, "-lc", f'printf "{start_tag}%s{end_tag}" "$PATH"']
+    try:
+        completed = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    out = completed.stdout or ""
+    s_idx = out.find(start_tag)
+    e_idx = out.find(end_tag, s_idx + len(start_tag)) if s_idx != -1 else -1
+    if s_idx == -1 or e_idx == -1:
+        return ""
+    extracted = out[s_idx + len(start_tag):e_idx]
+    if any(ord(c) < 32 for c in extracted):
+        return ""
+    return extracted
+
+
+def build_remote_path(base_path, prepend_dirs=(), *, prefer_base=False):
     ordered = []
     seen = set()
 
-    def add(item):
-        if item and item not in seen:
-            seen.add(item)
-            ordered.append(item)
+    def add_path_list(path_str):
+        for entry in path_str.split(os.pathsep):
+            if entry and entry not in seen:
+                seen.add(entry)
+                ordered.append(entry)
 
     for raw in prepend_dirs:
-        add(expand_remote_path(raw, "path_prepend"))
-    for entry in base_path.split(os.pathsep):
-        add(entry)
-    home = Path.home()
-    for std in (home / ".local" / "bin", home / ".cargo" / "bin", home / "go" / "bin", Path("/usr/local/go/bin")):
-        s = str(std)
-        if std.is_dir():
-            add(s)
+        exp = expand_remote_path(raw, "path_prepend")
+        if exp and exp not in seen:
+            seen.add(exp)
+            ordered.append(exp)
+
+    login_path = probe_login_path()
+    if prefer_base:
+        add_path_list(base_path)
+        add_path_list(login_path)
+    else:
+        add_path_list(login_path)
+        add_path_list(base_path)
     return os.pathsep.join(ordered)
 
 
@@ -1342,12 +1375,6 @@ def control(payload):
                     device = "cuda:0"
             except (RuntimeError, OSError):
                 gpus = []
-        home = Path.home()
-        existing_tool_dirs = [
-            f"~/{p.relative_to(home).as_posix()}" if p.is_relative_to(home) else str(p)
-            for p in (home / ".local" / "bin", home / ".cargo" / "bin", home / "go" / "bin")
-            if p.is_dir()
-        ]
         return {
             "status": "ok",
             "tools": tools,
@@ -1355,7 +1382,6 @@ def control(payload):
             "device": device,
             "gpus": gpus,
             "resolved_root": str(root),
-            "existing_tool_dirs": existing_tool_dirs,
         }
 
     if action == "doctor":
@@ -1733,7 +1759,9 @@ def worker(root, job):
                         effective_python = str(vpy)
             elif effective_python:
                 prepend.insert(0, str(Path(effective_python).parent))
-            env["PATH"] = build_remote_path(env.get("PATH", ""), prepend)
+            env["PATH"] = build_remote_path(
+                env.get("PATH", ""), prepend, prefer_base=("PATH" in request.get("env_static", {}))
+            )
 
             user_cvd = "CUDA_VISIBLE_DEVICES" in request.get("env_static", {}) or "CUDA_VISIBLE_DEVICES" in request.get("env_vars", {})
             if req_device.startswith("cuda"):

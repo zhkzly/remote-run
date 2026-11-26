@@ -1,26 +1,33 @@
 # Optional project-level configuration for remote-run (<repo_root>/.remote-run.toml).
-# Delete any field you do not need; projects without this file run out of the box.
+# Delete any section you do not need; projects without this file run out of the box.
 schema_version = 1
 
-# project = "my-project"                  # Optional fixed project ID across local folder renames
+# 1. Identity & Host/Env Defaults
+# project = "my-project"                  # Fixed remote project ID across local folder renames
 # host = "server"                         # Default host profile from hosts.toml
 # env = "venv"                            # "venv", "none", or a named env from hosts.toml
-# workspace = "default"                   # Note: normal single-checkout repos already default to "default";
-                                          # linked Git worktrees auto-isolate by branch unless overridden here.
+
+# 2. Workspace Isolation
+# Single-checkout repos default to "default" (keeps build caches across `git checkout -b`).
+# Linked Git worktrees automatically isolate per branch unless overridden here.
+# workspace = "default"
 # remote_dir = "/data/your-user/custom"   # Explicit remote dir override (cannot combine with [share].project)
 
+# 3. Sync Policy
 [sync]
 use_gitignore = true                      # Respect local .gitignore rules when uploading
-ignore = ["docs/", "papers/"]             # Local-only paths skipped during upload
+ignore = ["docs/", "papers/"]             # Local-only paths skipped during upload (never auto-deleted if kept locally)
 # Built-in preserve: .venv, outputs, checkpoints, .cache (never uploaded, never deleted)
 preserve = ["target/", "build/", "reports/"]
 
+# 4. Shared Assets
 [share]
-# Project directories shared across all linked Git worktrees via remote symlinks (auto-preserved):
+# Project directories shared across linked Git worktrees via remote symlinks (auto-preserved):
 # project = ["cache", "assets"]
 # Host-level shared assets from hosts.toml ("name" or "alias=name"; injects env vars only, NO symlinks):
-# host = ["hf-cache"]
+# host = ["dataset-v1"]
 
+# 5. Runtime Environment Variables
 [env_vars]
 # Supports {run_id}, {host}, {device}, {artifacts}, {code}, {python},
 #          {git_commit}, {git_branch}, {shared.<alias>.path|version|sha256}

@@ -30,7 +30,7 @@
         │  SSH ControlMaster 复用 + 带清单的安全增量同步（对用户近乎无感）
         ▼
 任意远程 Linux 主机（无需 sudo、无需安装 AI 工具、无需常驻 Daemon）
-  ├─ 连接与环境：支持 user@host / port / ~/ 路径、自动识别 ~/.cargo/bin 与 ~/go/bin、命名环境
+  ├─ 连接与环境：支持 user@host / port / ~/ 路径、自动继承远端登录 Shell PATH、命名环境
   ├─ 空间与同步：单目录切分支保留构建缓存，真 worktree 自动隔离，4 类文件严格分治防误删
   ├─ 执行与周期：无状态 tmux 或按需 --session、--follow 实时流式输出、PGID 干净取消
   └─ 可选资源层：纯 CPU 主机无锁并发；GPU 主机自动按卡排序加锁（--device / --no-gpu 灵活切换）

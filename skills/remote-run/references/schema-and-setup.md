@@ -22,7 +22,7 @@ ssh = "my-server"    # Required: ~/.ssh/config alias or "user@host" (NO ":port",
 | `root` | Remote path starting with `/...` or `~/...` (forbids `/`, bare `~`/`~/`, `..`, remote `$HOME`, `$HOME` ancestors) | `"~/.local/share/remote-run"` |
 | `device` | `"cpu"`, `"cuda"`, `"cuda:N"`, or `"cuda:N,M"` (unique GPU indices) | `"cpu"` |
 | `default_env` | Host env name from `.envs.*`, or built-in `"venv"` / `"none"` | `""` (no host Python injected) |
-| `path_prepend` | List of remote `/...` or `~/...` dirs added to `PATH` across all envs | `[]` (+ auto-discovered existing `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `/usr/local/go/bin`) |
+| `path_prepend` | List of remote `/...` or `~/...` dirs prepended to `PATH` (for `~/.bashrc`-guarded tools like `nvm`/`conda` or toolchain overrides) | `[]` (login shell `PATH` inherited automatically unless `REMOTE_RUN_INHERIT_LOGIN_PATH=0`) |
 
 ### Level 2 — Advanced Sections
 - **Resource lock overrides (`[hosts.<name>]`)**:

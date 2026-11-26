@@ -30,7 +30,7 @@ Laptop (Source of Truth: Editor + Claude Code / Codex / agy + API Keys + MCP)
         │  Multiplexed SSH (0700 ControlMaster) + smart manifest-tracked sync
         ▼
 Any Remote Linux Host (Zero AI tools, zero sudo, no daemon to install)
-  ├─ Connectivity & Env : user@host / port / ~/paths, auto-detected ~/.cargo/bin & ~/go/bin, venv/named envs
+  ├─ Connectivity & Env : user@host / port / ~/paths, auto login-shell PATH inheritance, venv/named envs
   ├─ Workspace & Flow   : branch-safe single checkouts, auto-isolated Git worktrees, 4-class sync safety
   ├─ Execution          : stateless tmux or opt-in --session, live --follow streaming, clean PGID cancel
   └─ Optional Resources : lock-free on CPU; automatic sorted flock + CUDA isolation on GPU (--device / --no-gpu)

@@ -4,7 +4,7 @@
 
 ## Architecture Overview
 
-- **Connectivity, Config & Environments**: Built-in `0700` SSH `ControlMaster` multiplexing, optional `port`, `user@host`, `~/` remote paths, named environments (`PATH` + env vars + optional Python), and automatic discovery of existing standard remote tool dirs (`~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `/usr/local/go/bin`).
+- **Connectivity, Config & Environments**: Built-in `0700` SSH `ControlMaster` multiplexing, optional `port`, `user@host`, `~/` remote paths, automatic remote login-shell `PATH` inheritance (opt-out via `REMOTE_RUN_INHERIT_LOGIN_PATH=0`), and optional `path_prepend` / named environments (`PATH` + env vars + optional Python).
 - **Workspace, Sync & Data Flow**: 4-category sync model (see below), automatic single-checkout cache preservation vs. linked Git worktree isolation, ownership markers, and safe artifact retrieval.
 - **Execution, Sessions & Lifecycle**: Stateless isolated `tmux` + PGID execution per run, opt-in `--session <name>` persistence, real-time `--follow` streaming, `tmux_session` reporting, and whitelist-only `prune`.
 - **Optional Resource & Concurrency Aspect**: Lock-free concurrency by default (`device = "cpu"`). When a host declares `cuda`, sorted multi-slot `flock` locks (`--device cuda:0,1` locks `gpu-0` and `gpu-1` in order) and CUDA visibility isolation apply cleanly; `--no-gpu` skips locks and hides CUDA.
