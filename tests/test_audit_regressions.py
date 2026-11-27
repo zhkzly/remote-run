@@ -340,14 +340,23 @@ class AuditRegressions(unittest.TestCase):
             root = Path(directory) / "remote"
             runs = root / "runs"
             locks_main = root / "locks"
+            loop_a = root / "loop-a"
+            loop_b = root / "loop-b"
             holder = runs / "rr-holder"
             mixed_slots = runs / "rr-mixed-slots"
             overflow_pid = runs / "rr-overflow-pid"
             bool_pid = runs / "rr-bool-pid"
+            symlink_loop = runs / "rr-symlink-loop"
             unreadable = runs / "rr-unreadable"
             waiter = runs / "rr-waiter"
-            for d in (holder, mixed_slots, overflow_pid, bool_pid, unreadable, waiter):
+            for d in (holder, mixed_slots, overflow_pid, bool_pid, symlink_loop, unreadable, waiter):
                 d.mkdir(parents=True)
+            loop_a.symlink_to(loop_b)
+            loop_b.symlink_to(loop_a)
+            if sys.version_info < (3, 13):
+                self.assertIsNone(rr.resolved_locks_dir({"locks_dir": str(loop_a)}))
+            with mock.patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+                self.assertIsNone(rr.resolved_locks_dir({"locks_dir": str(locks_main)}))
 
             base_req = {
                 "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
@@ -374,6 +383,11 @@ class AuditRegressions(unittest.TestCase):
                 "run_id": "rr-bool-pid", "status": "running", "waiting_for_lock": False,
                 "worker_pid": True, "started_at": rr.now(),
             })
+            rr.write_json(symlink_loop / "request.json", {**base_req, "locks_dir": str(loop_a)})
+            rr.write_json(symlink_loop / "state.json", {
+                "run_id": "rr-symlink-loop", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
             rr.write_json(unreadable / "request.json", base_req)
             rr.write_json(unreadable / "state.json", {
                 "run_id": "rr-unreadable", "status": "running", "waiting_for_lock": False,
@@ -387,6 +401,7 @@ class AuditRegressions(unittest.TestCase):
 
             orig_is_dir = Path.is_dir
             orig_is_file = Path.is_file
+            orig_resolve = Path.resolve
 
             def guarded_is_dir(path_obj):
                 if path_obj.name == "rr-unreadable":
@@ -398,6 +413,11 @@ class AuditRegressions(unittest.TestCase):
                     raise PermissionError(f"Permission denied: {path_obj}")
                 return orig_is_file(path_obj)
 
+            def guarded_resolve(path_obj, strict=False):
+                if path_obj.name == "loop-a":
+                    raise RuntimeError(f"Symlink loop from {path_obj}")
+                return orig_resolve(path_obj, strict=strict)
+
             os.chmod(unreadable, 0o000)
             try:
                 with mock.patch.object(rr, "tmux_program", return_value="/unused/tmux"), \
@@ -406,7 +426,8 @@ class AuditRegressions(unittest.TestCase):
                     self.assertEqual(st["status"], "queued")
                     self.assertEqual(st["blocked_by_runs"], ["rr-holder"])
                     with mock.patch.object(Path, "is_dir", guarded_is_dir), \
-                         mock.patch.object(Path, "is_file", guarded_is_file):
+                         mock.patch.object(Path, "is_file", guarded_is_file), \
+                         mock.patch.object(Path, "resolve", guarded_resolve):
                         st_perm = rr.state_of(waiter, root)
                         cancel_res = rr.remote_cancel(root, waiter)
                 self.assertEqual(st_perm["status"], "queued")

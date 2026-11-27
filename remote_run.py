@@ -1079,7 +1079,7 @@ def resolved_locks_dir(req):
         return None
     try:
         return Path(expand_remote_path(raw, "locks_dir")).resolve()
-    except (ValueError, OSError):
+    except (ValueError, OSError, RuntimeError):
         return None
 
 
@@ -1124,7 +1124,7 @@ def queue_holder_runs(root, job, req):
             if not run_process_alive(other_state):
                 continue
             holders.append(child.name)
-        except (ValueError, KeyError, TypeError, OverflowError, OSError):
+        except (ValueError, KeyError, TypeError, OverflowError, RuntimeError, OSError):
             continue
     return holders
 
