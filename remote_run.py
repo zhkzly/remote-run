@@ -949,24 +949,24 @@ def session_key_for(workdir, name):
 
 
 def pid_alive(pgid):
-    if not isinstance(pgid, int) or pgid <= 0:
+    if type(pgid) is not int or pgid <= 0:
         return False
     try:
         os.killpg(pgid, 0)
         return True
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except PermissionError:
         return True
 
 
 def single_pid_alive(pid):
-    if not isinstance(pid, int) or pid <= 0:
+    if type(pid) is not int or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
         return True
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except PermissionError:
         return True
@@ -1068,9 +1068,9 @@ def ensure_root_owned(root, *, init_root=False, dry_run=False):
 
 
 def valid_gpu_slots(raw):
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or not all(isinstance(slot, str) and slot for slot in raw):
         return set()
-    return {slot for slot in raw if isinstance(slot, str) and slot}
+    return set(raw)
 
 
 def resolved_locks_dir(req):
@@ -1099,12 +1099,17 @@ def queue_holder_runs(root, job, req):
         return []
     holders = []
     for child in children:
-        if child.name == job.name or not child.is_dir() or child.is_symlink():
-            continue
-        if not (child / "state.json").is_file() or not (child / "request.json").is_file():
+        if child.name == job.name:
             continue
         try:
-            other_req = read_json(child / "request.json")
+            if child.is_symlink() or not child.is_dir():
+                continue
+            state_path = child / "state.json"
+            req_path = child / "request.json"
+            if (state_path.is_symlink() or req_path.is_symlink()
+                    or not state_path.is_file() or not req_path.is_file()):
+                continue
+            other_req = read_json(req_path)
             if not isinstance(other_req, dict) or not other_req.get("use_gpu"):
                 continue
             other_locks = resolved_locks_dir(other_req)
@@ -1113,13 +1118,13 @@ def queue_holder_runs(root, job, req):
             other_slots = valid_gpu_slots(other_req.get("gpu_slots"))
             if not (wanted & other_slots):
                 continue
-            other_state = read_json(child / "state.json")
+            other_state = read_json(state_path)
             if not isinstance(other_state, dict) or other_state.get("status") != "running":
                 continue
             if not run_process_alive(other_state):
                 continue
             holders.append(child.name)
-        except (ValueError, KeyError, TypeError, OSError):
+        except (ValueError, KeyError, TypeError, OverflowError, OSError):
             continue
     return holders
 

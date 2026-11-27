@@ -329,6 +329,94 @@ class AuditRegressions(unittest.TestCase):
             self.assertIn("Queued waiting for GPU lock", msg)
             self.assertIn("rr-holder", msg)
 
+    def test_queue_holder_scan_skips_malformed_unreadable_and_overflow_siblings(self):
+        self.assertEqual(rr.valid_gpu_slots(["gpu-0", ["gpu-0"]]), set())
+        self.assertFalse(rr.single_pid_alive(10**30))
+        self.assertFalse(rr.pid_alive(10**30))
+        self.assertFalse(rr.single_pid_alive(True))
+        self.assertFalse(rr.pid_alive(True))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "remote"
+            runs = root / "runs"
+            locks_main = root / "locks"
+            holder = runs / "rr-holder"
+            mixed_slots = runs / "rr-mixed-slots"
+            overflow_pid = runs / "rr-overflow-pid"
+            bool_pid = runs / "rr-bool-pid"
+            unreadable = runs / "rr-unreadable"
+            waiter = runs / "rr-waiter"
+            for d in (holder, mixed_slots, overflow_pid, bool_pid, unreadable, waiter):
+                d.mkdir(parents=True)
+
+            base_req = {
+                "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
+                "locks_dir": str(locks_main), "use_gpu": True, "gpu_slots": ["gpu-0"],
+                "workdir": str(root / "w"),
+            }
+            rr.write_json(holder / "request.json", base_req)
+            rr.write_json(holder / "state.json", {
+                "run_id": "rr-holder", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
+            rr.write_json(mixed_slots / "request.json", {**base_req, "gpu_slots": ["gpu-0", ["gpu-0"]]})
+            rr.write_json(mixed_slots / "state.json", {
+                "run_id": "rr-mixed-slots", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
+            rr.write_json(overflow_pid / "request.json", base_req)
+            rr.write_json(overflow_pid / "state.json", {
+                "run_id": "rr-overflow-pid", "status": "running", "waiting_for_lock": False,
+                "worker_pid": 10**30, "child_pgid": 10**30, "started_at": rr.now(),
+            })
+            rr.write_json(bool_pid / "request.json", base_req)
+            rr.write_json(bool_pid / "state.json", {
+                "run_id": "rr-bool-pid", "status": "running", "waiting_for_lock": False,
+                "worker_pid": True, "started_at": rr.now(),
+            })
+            rr.write_json(unreadable / "request.json", base_req)
+            rr.write_json(unreadable / "state.json", {
+                "run_id": "rr-unreadable", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
+            rr.write_json(waiter / "request.json", base_req)
+            rr.write_json(waiter / "state.json", {
+                "run_id": "rr-waiter", "status": "queued", "waiting_for_lock": True,
+                "submitted_at": rr.now(),
+            })
+
+            orig_is_dir = Path.is_dir
+            orig_is_file = Path.is_file
+
+            def guarded_is_dir(path_obj):
+                if path_obj.name == "rr-unreadable":
+                    raise PermissionError(f"Permission denied: {path_obj}")
+                return orig_is_dir(path_obj)
+
+            def guarded_is_file(path_obj):
+                if path_obj.parent.name == "rr-unreadable":
+                    raise PermissionError(f"Permission denied: {path_obj}")
+                return orig_is_file(path_obj)
+
+            os.chmod(unreadable, 0o000)
+            try:
+                with mock.patch.object(rr, "tmux_program", return_value="/unused/tmux"), \
+                     mock.patch.object(rr.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+                    st = rr.state_of(waiter, root)
+                    self.assertEqual(st["status"], "queued")
+                    self.assertEqual(st["blocked_by_runs"], ["rr-holder"])
+                    with mock.patch.object(Path, "is_dir", guarded_is_dir), \
+                         mock.patch.object(Path, "is_file", guarded_is_file):
+                        st_perm = rr.state_of(waiter, root)
+                        cancel_res = rr.remote_cancel(root, waiter)
+                self.assertEqual(st_perm["status"], "queued")
+                self.assertEqual(st_perm["blocked_by_runs"], ["rr-holder"])
+                self.assertTrue((waiter / "cancel.request").is_file())
+                self.assertTrue(cancel_res["cancellation_requested"])
+                self.assertEqual(cancel_res["status"], "cancelled")
+            finally:
+                os.chmod(unreadable, 0o700)
+
     def test_worker_does_not_mark_session_lock_wait_as_gpu_lock_wait(self):
         import fcntl
         import time
