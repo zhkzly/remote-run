@@ -1,38 +1,25 @@
-# Global host configuration for remote-run (~/.config/remote-run/hosts.toml).
-# Minimal setup needs only `ssh`: `root` defaults to "~/.local/share/remote-run"
-# and `device` defaults to "cpu" (lock-free concurrent execution, any language).
-# Tip: Generate this automatically via `remote-run init <ssh-alias-or-user@host>`.
+# ~/.config/remote-run/hosts.toml  (v2 — Machine catalog ONLY, zero project bindings)
+# Minimal CPU host needs only `schema_version`, `[hosts.<name>]`, and `ssh`.
 
-schema_version = 1
-default_host = "server"
+schema_version = 2
+default_host = "builder"
 
-[hosts.server]
-# 1. Connection & Workspace Root
-ssh = "my-server"                               # ~/.ssh/config alias or "user@host" (set port below if custom)
-# port = 22                                     # Optional SSH port (1-65535)
-# root = "/data/your-user/remote-run-jobs"      # Default: "~/.local/share/remote-run"
+# Example 1: Minimal CPU build/test machine
+[hosts.builder]
+ssh = "linux-builder"                         # ~/.ssh/config alias or "user@host"
+# port = 22                                   # Optional custom SSH port (1-65535)
+# root = "~/.local/share/remote-run-v2"       # Optional remote state root
+# path = ["~/.local/bin", "~/.cargo/bin"]     # Optional machine-wide shared PATH entries
 
-# 2. Optional Hardware Resource Aspect (omit on CPU-only servers)
-# device = "cuda:0"                             # "cpu" (default), "cuda:0", or "cuda:0,1" (enables sorted GPU locks + CUDA isolation)
-# locks_dir = "/data/your-user/remote-locks"    # Optional private directory outside workspaces. Defaults to <root>/locks
-# gpu_slot = "gpu-0"                            # Optional legacy lock added to the per-card locks
+# [hosts.builder.env]                         # Optional machine-wide shared env vars (e.g. caches)
+# CARGO_HOME = "/srv/cache/cargo"
 
-# 3. Optional Environment Overrides
-# Commands may inherit the remote login PATH. SSH must already find Python 3.11+.
-# Only set `path_prepend` for tools hidden inside interactive ~/.bashrc guards (e.g., nvm/conda) or custom toolchains.
-# default_env = "venv"                          # "venv", "none", or a named env defined below
-# path_prepend = ["/opt/custom/bin"]
+# Example 2: Multi-GPU workstation (GPU allocation is opt-in per binding or --gpus)
+[hosts.gpu-workstation]
+ssh = "workstation"
+root = "/srv/remote-run-v2"
+path = ["~/.local/bin"]
 
-# --- Named Environments (optional) ---
-# [hosts.server.envs.custom]
-# python = "/data/your-user/envs/custom/bin/python"   # Optional; omit for non-Python toolchains
-# path_prepend = ["/opt/toolchain/bin"]
-# [hosts.server.envs.custom.env]
-# CACHE_DIR = "/data/your-user/cache"
-
-# --- Host-Level Shared Assets (optional, write access follows host permissions) ---
-# Exposes REMOTE_RUN_SHARED_<ALIAS>_PATH / _VERSION / _SHA256 and {shared.<alias>.*} placeholders (no symlinks).
-# [hosts.server.shared.dataset-v1]
-# path = "/data/your-user/datasets/v1"
-# manifest = "manifest.json"
-# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+[hosts.gpu-workstation.gpu]
+devices = [0, 1]
+# locks_dir = "/srv/remote-run-v2/locks"      # Optional trusted 0700 lock directory

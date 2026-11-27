@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Standardized zero-dependency MCP stdio server wrapping remote_run.py."""
+"""Zero-dependency stdio MCP server for remote-run v2 (typed service subprocess dispatch)."""
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -11,18 +13,20 @@ import sys
 import threading
 import time
 
+from remote_run_local import __version__
+
 CLI = str(Path(__file__).resolve().parent / "remote_run.py")
-SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+SUPPORTED_PROTOCOLS = ("2025-06-18", "2024-11-05")
 STDOUT_LOCK = threading.Lock()
 CONTROL_TOOLS = {"remote_hosts", "remote_cancel"}
 MAX_PENDING = 32
-MAX_REQUEST_CHARS = 1024 * 1024
+MAX_REQUEST_BYTES = 1024 * 1024
 REQUEST = threading.local()
 
 TOOLS = [
     {
         "name": "remote_hosts",
-        "description": "List configured remote compute hosts, devices, named environments (PATH, env vars, optional Python), and host-level shared assets.",
+        "description": "List configured remote Linux hosts, roots, base PATH/env keys, and optional GPU devices.",
         "inputSchema": {
             "type": "object",
             "properties": {"config": {"type": "string", "description": "Optional path to hosts.toml"}},
@@ -31,52 +35,92 @@ TOOLS = [
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
-        "name": "remote_config",
-        "description": "Validate hosts.toml and optional .remote-run.toml and return the merged remote workspace config.",
+        "name": "remote_bind",
+        "description": "Bind a local repository (all worktrees) or checkout (single worktree) to a remote host, GPU subset, note, PATH entries, or env vars in XDG bindings.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "Absolute path to the local project directory"},
-                "host": {"type": "string", "description": "Optional host name override"},
-                "remote_dir": {"type": "string", "description": "Optional explicit remote folder override"},
-                "workspace": {"type": "string", "description": "Optional workspace ID override"},
+                "scope": {"type": "string", "enum": ["checkout", "repo"], "description": "'repo' (inherited by all worktrees) or 'checkout' (this checkout only)"},
+                "host": {"type": "string", "description": "Host alias from hosts.toml"},
+                "workspace": {"type": "string", "description": "Workspace ID pin (checkout scope only)"},
+                "gpus": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 1, "description": "Default GPU indices for this binding (use clear_gpus=true to reset to CPU)"},
+                "clear_gpus": {"type": "boolean", "description": "Clear bound GPUs back to CPU default"},
+                "note": {"type": "string", "description": "Short note describing remote preinstalled tools"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Remote PATH entries for this project on the bound host"},
+                "env_vars": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Literal env vars for this project on the bound host"},
+                "unset_env": {"type": "array", "items": {"type": "string"}, "description": "Env keys to remove from binding"},
+                "replace": {"type": "boolean", "description": "Replace existing binding instead of merging"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "required": ["repo"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "remote_unbind",
+        "description": "Remove a private repo- or checkout-scoped XDG binding.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Absolute path to the local project directory"},
+                "scope": {"type": "string", "enum": ["checkout", "repo"], "description": "Binding scope to remove"},
+            },
+            "required": ["repo"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "remote_config",
+        "description": "Validate hosts.toml, .remote-run.toml, and bindings and return the merged workspace, PATH layers, redacted env origins, GPU selection, sync and pull policies.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "Absolute path to local project dir (omit for host-only view)"},
+                "host": {"type": "string", "description": "Optional host alias override"},
+                "workspace": {"type": "string", "description": "Optional workspace ID override"},
+                "gpus": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 1, "description": "Optional GPU index preview (use no_gpu=true for CPU preview)"},
+                "no_gpu": {"type": "boolean", "description": "Preview CPU-only execution"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Extra PATH entries to preview"},
+                "env_vars": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra env vars to preview"},
+                "max_untracked_mib": {"type": "integer", "minimum": 0, "description": "Override untracked upload budget (MiB)"},
+                "config": {"type": "string", "description": "Optional path to hosts.toml"},
+            },
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
         "name": "remote_doctor",
-        "description": "Check SSH connectivity, bash/tmux/rsync, GPUs, commands on PATH, optional Python env, and shared assets on a host.",
+        "description": "Read-only check of SSH connectivity, remote bash/tmux/rsync, root/workspace readiness, layered PATH, bare or literal-path commands, and optional NVIDIA GPUs.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "Absolute path to local project dir to infer host, env, and [share].host from .remote-run.toml (pass explicitly when calling via user-level MCP)"},
-                "host": {"type": "string", "description": "Optional host name override"},
-                "env": {"type": "string", "description": "Environment name to probe (or 'venv' / 'none')"},
-                "shared": {"type": "array", "items": {"type": "string"}, "description": "Host shared asset names to verify"},
-                "check_cmds": {"type": "array", "items": {"type": "string"}, "description": "Commands/tools to check on remote PATH (e.g., cargo, go, node, uv)"},
-                "check_imports": {"type": "array", "items": {"type": "string"}, "description": "Python modules to test importing"},
-                "check_cuda": {"type": "boolean", "description": "Probe torch.cuda.is_available()"},
+                "repo": {"type": "string", "description": "Absolute path to local project dir (optional for host-only check)"},
+                "host": {"type": "string", "description": "Optional host alias override"},
+                "workspace": {"type": "string", "description": "Optional workspace ID override"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Extra PATH entries to include in probe"},
+                "check_cmds": {"type": "array", "items": {"type": "string"}, "description": "Bare command names or literal paths (/..., ~/..., relative) to verify"},
+                "session": {"type": "string", "description": "Optional session name to match saved cwd for relative probes"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
     },
     {
         "name": "remote_sync",
-        "description": "One-way incremental sync to a remote workspace. Can overwrite source paths and prune owned files. Use dry_run to preview.",
+        "description": "One-way manifest-tracked sync to a remote workspace with untracked size budget protection and verified ghost cleanup. Use dry_run=true to preview.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "Absolute path to the local project directory"},
-                "host": {"type": "string", "description": "Optional host name override"},
-                "remote_dir": {"type": "string", "description": "Optional explicit remote folder override"},
+                "host": {"type": "string", "description": "Optional host alias override"},
                 "workspace": {"type": "string", "description": "Optional workspace ID override"},
-                "dry_run": {"type": "boolean", "description": "Preview files that would be updated without modifying remote"},
+                "dry_run": {"type": "boolean", "description": "Preview files, budget, and ghost cleanup without modifying remote"},
+                "max_untracked_mib": {"type": "integer", "minimum": 0, "description": "Override untracked upload budget (MiB, 0=unlimited)"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "required": ["repo"],
@@ -86,49 +130,52 @@ TOOLS = [
     },
     {
         "name": "remote_exec",
-        "description": "Sync local code incrementally (unless no_sync=true) and run a command or shell snippet on a remote host; detaches cleanly if longer than wait.",
+        "description": "Sync local code (unless no_sync=true) and execute either an argv array OR a bash shell string remotely; detaches cleanly if longer than wait.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "Absolute path to local project dir (required when syncing, and still recommended with no_sync=true whenever .remote-run.toml host/env/shared settings should apply)"},
-                "host": {"type": "string", "description": "Optional host name override"},
-                "remote_dir": {"type": "string", "description": "Optional explicit remote folder override"},
+                "repo": {"type": "string", "description": "Absolute path to local project dir (required for project runs; omit with no_sync=true for ad-hoc host runs)"},
+                "host": {"type": "string", "description": "Optional host alias override"},
                 "workspace": {"type": "string", "description": "Optional workspace ID override"},
-                "command": {"type": "array", "items": {"type": "string"}, "description": "Argv array to execute (use either command or shell)"},
-                "shell": {"type": "string", "description": "Compound bash command string (use either shell or command)"},
-                "no_sync": {"type": "boolean", "description": "Skip rsync upload before executing"},
-                "no_project": {"type": "boolean", "description": "Ignore project config (requires no_sync)"},
+                "remote_dir": {"type": "string", "description": "Existing remote dir (only for ad-hoc runs without repo + no_sync=true)"},
+                "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Executable + arguments array (mutually exclusive with shell)"},
+                "shell": {"type": "string", "minLength": 1, "description": "Explicit bash command string (mutually exclusive with argv)"},
+                "no_sync": {"type": "boolean", "description": "Skip manifest upload before executing"},
                 "session": {"type": "string", "description": "Opt-in persistent shell session name"},
-                "wait": {"type": "number", "description": "Seconds to wait before detaching (0=async, default 15)"},
-                "device": {"type": "string", "description": "Per-run device override: 'cpu' or 'cuda:N[,M...]'"},
-                "no_gpu": {"type": "boolean", "description": "Skip GPU slot locks and run without CUDA allocation"},
-                "env": {"type": "string", "description": "Host environment name override, 'venv', or 'none'"},
-                "shared": {"type": "array", "items": {"type": "string"}, "description": "Bind host shared assets (NAME or ALIAS=NAME)"},
-                "env_vars": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra env vars (supports {artifacts}/{shared.*})"},
+                "wait": {"type": "number", "minimum": 0, "description": "Seconds to wait before detaching (0=async, default 15)"},
+                "gpus": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 1, "description": "Allocate NVIDIA GPU indices (use no_gpu=true for CPU)"},
+                "no_gpu": {"type": "boolean", "description": "Force CPU execution without GPU locks"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Prepend remote or workspace-relative PATH directories"},
+                "env_vars": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra literal KEY=VALUE env vars"},
                 "run_id": {"type": "string", "description": "Optional run ID for idempotent retries"},
-                "tail_bytes": {"type": "integer", "description": "Max trailing log bytes to return (default 8192)"},
-                "raw_log": {"type": "boolean", "description": "Disable carriage-return folding in log output"},
+                "tail_bytes": {"type": "integer", "minimum": 0, "description": "Max trailing log bytes to return (default 8192)"},
+                "raw_log": {"type": "boolean", "description": "Disable carriage-return folding"},
+                "max_untracked_mib": {"type": "integer", "minimum": 0, "description": "Override untracked upload budget (MiB)"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
+            "oneOf": [
+                {"required": ["argv"], "not": {"required": ["shell"]}},
+                {"required": ["shell"], "not": {"required": ["argv"]}},
+            ],
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     },
     {
         "name": "remote_status",
-        "description": "Check a remote run status and log slice by run_id, or list recent runs if run_id is omitted.",
+        "description": "Inspect a remote run status and UTF-8-aligned log slice by run_id, or list recent runs when run_id is omitted.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Optional host name override"},
                 "run_id": {"type": "string", "description": "Run ID to inspect (omit to list recent runs)"},
-                "wait": {"type": "number", "description": "Seconds to wait for terminal status (keep short in MCP, e.g. 0-60s, to avoid client tool-call timeouts; poll or use timers for longer runs)"},
-                "offset": {"type": "integer", "description": "Byte offset to read log from"},
-                "tail_bytes": {"type": "integer", "description": "Max log bytes to return"},
+                "host": {"type": "string", "description": "Host alias from the submission receipt"},
+                "repo": {"type": "string", "description": "Optional local project dir to infer host or filter listed runs"},
+                "project": {"type": "string", "description": "Optional project_id filter when listing runs"},
+                "wait": {"type": "number", "minimum": 0, "description": "Seconds to wait for terminal status (default 0; prefer <= 90s over MCP to avoid client call timeouts)"},
+                "offset": {"type": "integer", "minimum": 0, "description": "Byte offset to read log from"},
+                "tail_bytes": {"type": "integer", "minimum": 0, "description": "Max log bytes to return (default 8192)"},
                 "raw_log": {"type": "boolean", "description": "Disable carriage-return folding"},
-                "limit": {"type": "integer", "description": "Max recent runs to list"},
-                "project": {"type": "string", "description": "Filter listed runs by project_id"},
-                "repo": {"type": "string", "description": "Absolute path to local project dir to filter listed runs by project"},
+                "limit": {"type": "integer", "minimum": 1, "description": "Max recent runs to list (default 20)"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "additionalProperties": False,
@@ -137,12 +184,13 @@ TOOLS = [
     },
     {
         "name": "remote_cancel",
-        "description": "Request cancellation of a queued or running job, report the observed status and retain logs.",
+        "description": "Request cancellation of a running or queued remote job and return its last observed status.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Optional host name override"},
                 "run_id": {"type": "string", "description": "Run ID to cancel"},
+                "host": {"type": "string", "description": "Host alias from the submission receipt"},
+                "repo": {"type": "string", "description": "Optional repo to infer bound host"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "required": ["run_id"],
@@ -152,24 +200,25 @@ TOOLS = [
     },
     {
         "name": "remote_pull",
-        "description": "Pull logs, metadata, eligible artifacts, and optional workspace paths (saved under <destination>/workspace/) to a local directory.",
+        "description": "Pull terminal run logs, metadata, eligible artifacts (size + glob policy), explicit artifacts, or workspace paths atomically to a local directory.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Optional host name override"},
                 "run_id": {"type": "string", "description": "Terminal run ID to pull from"},
-                "destination": {"type": "string", "description": "Local destination path (must not exist unless force=true)"},
-                "all_artifacts": {"type": "boolean", "description": "Include checkpoint files and artifacts exceeding max_file_mb"},
-                "max_file_mb": {"type": "number", "description": "Max artifact size in MB when all_artifacts=false"},
-                "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative paths inside remote workspace to pull (saved under <destination>/workspace/<path>, reported as workdir_destination)"},
-                "paths_only": {"type": "boolean", "description": "Pull only requested workspace paths without re-fetching job logs/artifacts (requires paths)"},
-                "force": {"type": "boolean", "description": "Merge pulled files into an existing destination directory without deleting other files"},
+                "destination": {"type": "string", "description": "Local destination directory (must not exist unless force=true)"},
+                "host": {"type": "string", "description": "Host alias from the submission receipt"},
+                "repo": {"type": "string", "description": "Optional repo to infer bound host"},
+                "max_file_mib": {"type": "integer", "minimum": 0, "description": "Override recorded artifact size cap (MiB, 0=unlimited)"},
+                "artifacts": {"type": "array", "items": {"type": "string"}, "description": "Exact artifact relative paths to pull (bypasses size/exclude filters)"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative workspace paths pulled into <destination>/workspace/<path> (omit files already in $REMOTE_RUN_ARTIFACTS to avoid duplicate downloads)"},
+                "paths_only": {"type": "boolean", "description": "Pull only workspace paths"},
+                "force": {"type": "boolean", "description": "Atomically merge into existing destination directory"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "required": ["run_id", "destination"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     },
     {
         "name": "remote_session",
@@ -178,11 +227,11 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["list", "reset"], "description": "Session operation"},
-                "name": {"type": "string", "description": "Session name (required when action=reset)"},
-                "repo": {"type": "string", "description": "Local project directory"},
-                "host": {"type": "string", "description": "Optional host name override"},
-                "remote_dir": {"type": "string", "description": "Optional explicit remote folder override"},
+                "name": {"type": "string", "description": "Session name (required for reset)"},
+                "host": {"type": "string", "description": "Optional host alias override"},
+                "repo": {"type": "string", "description": "Optional local project dir"},
                 "workspace": {"type": "string", "description": "Optional workspace ID override"},
+                "remote_dir": {"type": "string", "description": "Optional explicit remote dir"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "required": ["action"],
@@ -192,353 +241,521 @@ TOOLS = [
     },
     {
         "name": "remote_prune",
-        "description": "Inspect or remove old terminal run directories on the remote host (dry-run unless apply=true).",
+        "description": "Inspect (default dry-run) or remove old terminal run directories on a remote host, returning summary counts.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Optional host name override"},
-                "days": {"type": "number", "description": "Remove terminal runs older than this many days (default 14)"},
-                "apply": {"type": "boolean", "description": "Actually delete old terminal runs (default false)"},
+                "host": {"type": "string", "description": "Optional host alias override"},
+                "repo": {"type": "string", "description": "Optional repo to infer bound host"},
+                "days": {"type": "number", "minimum": 0, "description": "Age threshold in days (default 14)"},
+                "apply": {"type": "boolean", "description": "Actually delete eligible runs (default false = dry-run)"},
+                "verbose": {"type": "boolean", "description": "Include full skipped_unmanaged list instead of 20-item sample"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},
             },
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     },
 ]
 
-
-SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in TOOLS}
-
-
-def tool_error(message):
-    return {"content": [{"type": "text", "text": message}], "isError": True}
+TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
-def validate_argument(value, schema, label):
-    kind = schema["type"]
-    if kind == "number":
-        if type(value) not in (int, float) or not math.isfinite(value):
-            raise ValueError(f"{label} must be a finite number")
-    elif type(value) is not {"boolean": bool, "integer": int, "string": str, "array": list, "object": dict}[kind]:
-        raise ValueError(f"{label} must be a JSON {kind}")
-    if "enum" in schema and value not in schema["enum"]:
-        raise ValueError(f"{label} must be one of {schema['enum']}")
-    if kind == "array":
-        for index, entry in enumerate(value):
-            validate_argument(entry, schema["items"], f"{label}[{index}]")
-    elif kind == "object":
-        properties = schema.get("properties", {})
-        missing = schema.get("required", ())
-        if any(key not in value for key in missing):
-            raise ValueError(f"{label} requires {', '.join(key for key in missing if key not in value)}")
-        additional = schema["additionalProperties"]
-        for key, entry in value.items():
-            child = properties.get(key, additional)
-            if child is False:
-                raise ValueError(f"Unknown argument {label}.{key}")
-            validate_argument(entry, child, f"{label}.{key}")
+class RequestCancelled(Exception):
+    pass
 
 
-def safe_pos(val, label):
-    if not isinstance(val, str) or not val or val.startswith("-"):
-        raise ValueError(f"Invalid {label}: {val!r}")
-    return val
+class RequestSlot:
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+
+    def attach(self, proc: subprocess.Popen) -> None:
+        with self.lock:
+            self.proc = proc
+            cancelled = self.cancelled.is_set()
+        if cancelled:
+            terminate_process(proc)
+
+    def detach(self, proc: subprocess.Popen) -> None:
+        with self.lock:
+            if self.proc is proc:
+                self.proc = None
+
+    def cancel(self) -> None:
+        with self.lock:
+            self.cancelled.set()
+            proc = self.proc
+        if proc is not None:
+            terminate_process(proc)
 
 
-def run_cli(argv, *, timeout=120):
-    stopped = getattr(REQUEST, "cancelled", None)
-    if stopped is not None and stopped.is_set():
-        return tool_error("Request cancelled before launch")
-    deadline = time.monotonic() + timeout
-    with subprocess.Popen(
-        [sys.executable, "-B", CLI, *argv], stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-    ) as proc:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or (stopped is not None and stopped.is_set()):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    stdout, stderr = proc.communicate(timeout=1)
-                except subprocess.TimeoutExpired as expired:
-                    stdout = (expired.stdout or b"").decode(errors="replace")
-                    stderr = (expired.stderr or b"").decode(errors="replace")
-                why = "Request cancelled locally" if stopped is not None and stopped.is_set() else "Request timed out"
-                return tool_error(f"{why}. {stderr.strip() or stdout.strip()}".strip())
-            try:
-                stdout, stderr = proc.communicate(timeout=min(remaining, 0.25))
-                break
-            except subprocess.TimeoutExpired:
-                continue
-    if proc.returncode == 0 or (proc.returncode == 2 and stdout.strip()):
-        return {"content": [{"type": "text", "text": stdout.strip()}], "isError": proc.returncode != 0}
-    return tool_error(stderr.strip() or stdout.strip() or f"exit {proc.returncode}")
-
-
-def check_list(val, label):
-    if val is None:
-        return []
-    if not isinstance(val, list):
-        raise ValueError(f"{label} must be an array")
-    return val
-
-
-def check_str_map(val, label):
-    if val is None:
-        return {}
-    if not isinstance(val, dict):
-        raise ValueError(f"{label} must be an object")
-    return val
-
-
-def common_flags(a):
-    out = []
-    if a.get("config") is not None:
-        out.extend(["--config", str(a["config"])])
-    if a.get("host") is not None:
-        out.extend(["--host", str(a["host"])])
-    return out
-
-
-def call_tool(name, a):
-    if not isinstance(name, str) or name not in SCHEMAS:
-        return tool_error(f"Unknown tool: {name!r}")
+def terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
     try:
-        validate_argument(a, SCHEMAS[name], name)
-    except (OverflowError, ValueError) as exc:
-        return tool_error(str(exc))
-    if name == "remote_exec" and bool(a.get("command")) == bool(a.get("shell")):
-        return tool_error("remote_exec requires exactly one non-empty command or shell")
-    if name == "remote_exec" and a.get("no_project") and not a.get("no_sync"):
-        return tool_error("remote_exec no_project requires no_sync")
-    if name == "remote_pull" and a.get("paths_only") and not a.get("paths"):
-        return tool_error("remote_pull paths_only requires paths")
-    if name == "remote_hosts":
-        return run_cli([*(["--config", str(a["config"])] if a.get("config") is not None else []), "hosts"])
-    if name == "remote_config":
-        if not a.get("repo"):
-            return {"content": [{"type": "text", "text": "remote_config requires 'repo'"}], "isError": True}
-        argv = [*common_flags(a), "config", "--repo", str(a["repo"])]
-        for k, flag in (("remote_dir", "--remote-dir"), ("workspace", "--workspace")):
-            if a.get(k) is not None:
-                argv.extend([flag, str(a[k])])
-        return run_cli(argv)
-    if name == "remote_doctor":
-        argv = [*common_flags(a), "doctor"]
-        if a.get("repo") is not None:
-            argv.extend(["--repo", str(a["repo"])])
-        if a.get("env") is not None:
-            argv.extend(["--env", str(a["env"])])
-        for s in check_list(a.get("shared"), "shared"):
-            argv.extend(["--shared", s])
-        for c in check_list(a.get("check_cmds"), "check_cmds"):
-            argv.extend(["--check-cmd", c])
-        for m in check_list(a.get("check_imports"), "check_imports"):
-            argv.extend(["--check-import", m])
-        if a.get("check_cuda"):
-            argv.append("--check-cuda")
-        return run_cli(argv)
-    if name == "remote_sync":
-        if not a.get("repo"):
-            return {"content": [{"type": "text", "text": "remote_sync requires 'repo'"}], "isError": True}
-        argv = [*common_flags(a), "sync", "--repo", str(a["repo"])]
-        for k, flag in (("remote_dir", "--remote-dir"), ("workspace", "--workspace")):
-            if a.get(k) is not None:
-                argv.extend([flag, str(a[k])])
-        if a.get("dry_run"):
-            argv.append("--dry-run")
-        return run_cli(argv, timeout=180)
-    if name == "remote_exec":
-        if not a.get("no_sync") and not a.get("repo"):
-            return {"content": [{"type": "text", "text": "remote_exec requires 'repo' unless no_sync=true"}], "isError": True}
-        argv = [*common_flags(a), "exec"]
-        if a.get("no_project"):
-            argv.append("--no-project")
-        for k, flag in (("repo", "--repo"), ("remote_dir", "--remote-dir"), ("workspace", "--workspace"),
-                        ("session", "--session"), ("shell", "--shell"), ("device", "--device"),
-                        ("env", "--env"), ("run_id", "--run-id")):
-            if a.get(k) is not None:
-                argv.extend([flag, str(a[k])])
-        if a.get("no_sync"):
-            argv.append("--no-sync")
-        if a.get("no_gpu"):
-            argv.append("--no-gpu")
-        if a.get("wait") is not None:
-            argv.extend(["--wait", str(float(a["wait"]))])
-        if a.get("tail_bytes") is not None:
-            argv.extend(["--tail-bytes", str(int(a["tail_bytes"]))])
-        if a.get("raw_log"):
-            argv.append("--raw-log")
-        for s in check_list(a.get("shared"), "shared"):
-            argv.extend(["--shared", s])
-        for k, v in check_str_map(a.get("env_vars"), "env_vars").items():
-            argv.extend(["--env-var", f"{k}={v}"])
-        cmd_list = check_list(a.get("command"), "command")
-        if cmd_list:
-            argv.append("--")
-            argv.extend(cmd_list)
-        wait_val = float(a["wait"]) if a.get("wait") is not None else 15.0
-        base = 360 if not a.get("no_sync") else 90
-        extra = 180 if not a.get("no_sync") else 60
-        return run_cli(argv, timeout=max(base, int(wait_val) + extra))
-    if name == "remote_status":
-        argv = [*common_flags(a), "status"]
-        if a.get("run_id") is not None:
-            argv.append(safe_pos(a["run_id"], "run_id"))
-        if a.get("wait") is not None:
-            argv.extend(["--wait", str(float(a["wait"]))])
-        if a.get("offset") is not None:
-            argv.extend(["--offset", str(int(a["offset"]))])
-        if a.get("tail_bytes") is not None:
-            argv.extend(["--tail-bytes", str(int(a["tail_bytes"]))])
-        if a.get("raw_log"):
-            argv.append("--raw-log")
-        if a.get("limit") is not None:
-            argv.extend(["--limit", str(int(a["limit"]))])
-        if a.get("project") is not None:
-            argv.extend(["--project", str(a["project"])])
-        if a.get("repo") is not None:
-            argv.extend(["--repo", str(a["repo"])])
-        wait_val = float(a["wait"]) if a.get("wait") is not None else 0.0
-        return run_cli(argv, timeout=max(60, int(wait_val) + 45))
-    if name == "remote_cancel":
-        if not a.get("run_id"):
-            return {"content": [{"type": "text", "text": "remote_cancel requires 'run_id'"}], "isError": True}
-        return run_cli([*common_flags(a), "cancel", safe_pos(a["run_id"], "run_id")])
-    if name == "remote_pull":
-        if not a.get("run_id") or not a.get("destination"):
-            return {"content": [{"type": "text", "text": "remote_pull requires 'run_id' and 'destination'"}], "isError": True}
-        argv = [*common_flags(a), "pull", safe_pos(a["run_id"], "run_id"), safe_pos(a["destination"], "destination")]
-        if a.get("all_artifacts"):
-            argv.append("--all-artifacts")
-        if a.get("max_file_mb") is not None:
-            argv.extend(["--max-file-mb", str(float(a["max_file_mb"]))])
-        for p in check_list(a.get("paths"), "paths"):
-            argv.extend(["--path", p])
-        if a.get("paths_only"):
-            argv.append("--paths-only")
-        if a.get("force"):
-            argv.append("--force")
-        return run_cli(argv, timeout=360)
-    if name == "remote_session":
-        sub = a.get("action")
-        if sub not in ("list", "reset"):
-            return {"content": [{"type": "text", "text": "remote_session action must be 'list' or 'reset'"}], "isError": True}
-        argv = [*common_flags(a), "session", sub]
-        if sub == "reset":
-            if not a.get("name"):
-                return {"content": [{"type": "text", "text": "remote_session reset requires 'name'"}], "isError": True}
-            argv.append(safe_pos(a["name"], "name"))
-        for k, flag in (("repo", "--repo"), ("remote_dir", "--remote-dir"), ("workspace", "--workspace")):
-            if a.get(k) is not None:
-                argv.extend([flag, str(a[k])])
-        return run_cli(argv)
-    if name == "remote_prune":
-        argv = [*common_flags(a), "prune"]
-        if a.get("days") is not None:
-            argv.extend(["--days", str(float(a["days"]))])
-        if a.get("apply"):
-            argv.append("--apply")
-        return run_cli(argv)
-    return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            return
+    deadline = time.monotonic() + 1.0
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
 
-def respond(msg_id, result=None, error=None):
-    payload = {"jsonrpc": "2.0", "id": msg_id}
-    if error is not None:
-        payload["error"] = error
-    else:
-        payload["result"] = result
-    line = json.dumps(payload, allow_nan=False) + "\n"
+def send(msg: dict) -> None:
     with STDOUT_LOCK:
-        sys.stdout.write(line)
+        sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
 
-def handle_tool_call(msg_id, params, cancelled):
-    REQUEST.cancelled = cancelled
+def ok(req_id, result: dict) -> None:
+    send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def err(req_id, code: int, message: str) -> None:
+    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+
+def check_allowed_keys(args: dict, tool_name: str) -> None:
+    if not isinstance(args, dict):
+        raise ValueError("Tool arguments must be a JSON object")
+    allowed = set(TOOLS_BY_NAME[tool_name]["inputSchema"]["properties"])
+    unknown = set(args) - allowed
+    if unknown:
+        raise ValueError(f"Unknown argument(s) for {tool_name}: {', '.join(sorted(unknown))}")
+
+
+def str_arg(args: dict, key: str, *, required: bool = False) -> str | None:
+    if key not in args or args[key] is None:
+        if required:
+            raise ValueError(f"{key} is required")
+        return None
+    val = args[key]
+    if not isinstance(val, str) or (required and not val):
+        raise ValueError(f"{key} must be a non-empty string" if required else f"{key} must be a string")
+    return val
+
+
+def bool_arg(args: dict, key: str, default: bool = False) -> bool:
+    if key not in args or args[key] is None:
+        return default
+    val = args[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return val
+
+
+def int_arg(args: dict, key: str, *, minimum: int = 0) -> int | None:
+    if key not in args or args[key] is None:
+        return None
+    val = args[key]
+    if isinstance(val, bool) or not isinstance(val, int) or val < minimum:
+        raise ValueError(f"{key} must be an integer >= {minimum}")
+    return val
+
+
+def num_arg(args: dict, key: str, default: float) -> float:
+    if key not in args or args[key] is None:
+        return default
+    val = args[key]
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0:
+        raise ValueError(f"{key} must be a finite non-negative number")
+    return float(val)
+
+
+def str_list_arg(args: dict, key: str) -> list[str] | None:
+    if key not in args or args[key] is None:
+        return None
+    val = args[key]
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        raise ValueError(f"{key} must be an array of strings")
+    return list(val)
+
+
+def int_list_arg(args: dict, key: str, *, non_empty: bool = False) -> list[int] | None:
+    if key not in args or args[key] is None:
+        return None
+    val = args[key]
+    if not isinstance(val, list) or not all(not isinstance(x, bool) and isinstance(x, int) and x >= 0 for x in val):
+        raise ValueError(f"{key} must be an array of non-negative integers")
+    if non_empty and not val:
+        raise ValueError(f"{key} must be non-empty (use no_gpu=true or clear_gpus=true for CPU)")
+    return list(val)
+
+
+def env_map_arg(args: dict, key: str) -> dict[str, str] | None:
+    if key not in args or args[key] is None:
+        return None
+    val = args[key]
+    if not isinstance(val, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in val.items()):
+        raise ValueError(f"{key} must be an object mapping strings to strings")
+    return dict(val)
+
+
+def run_service_subprocess(op: str, params: dict, timeout: float = 180) -> tuple[int, str, str]:
+    slot = getattr(REQUEST, "slot", None)
+    if slot is not None and slot.cancelled.is_set():
+        raise RequestCancelled("Request cancelled")
+    payload = json.dumps({"op": op, "params": params}, ensure_ascii=False)
+    proc = subprocess.Popen(
+        [sys.executable, "-B", CLI, "_service_rpc"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    if slot is not None:
+        slot.attach(proc)
     try:
-        respond(msg_id, call_tool(params.get("name", ""), params.get("arguments", {})))
-    except Exception as exc:
-        respond(msg_id, tool_error(f"Tool error: {exc}"))
+        try:
+            stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            terminate_process(proc)
+            stdout, stderr = proc.communicate()
+            raise RuntimeError(f"{op} timed out after {int(timeout)}s")
     finally:
-        del REQUEST.cancelled
+        if slot is not None:
+            slot.detach(proc)
+    if slot is not None and slot.cancelled.is_set():
+        raise RequestCancelled("Request cancelled")
+    return proc.returncode, stdout.strip(), stderr.strip()
 
 
-def main():
-    capacity = threading.BoundedSemaphore(MAX_PENDING)
-    control_capacity = threading.BoundedSemaphore(MAX_PENDING)
-    pending = {}
-    with ThreadPoolExecutor(max_workers=8) as pool, ThreadPoolExecutor(max_workers=2) as control_pool:
-        while line := sys.stdin.readline(MAX_REQUEST_CHARS + 1):
-            if len(line) > MAX_REQUEST_CHARS:
-                while line and not line.endswith("\n"):
-                    line = sys.stdin.readline(MAX_REQUEST_CHARS + 1)
-                respond(None, error={"code": -32700, "message": "Request exceeds the size limit"})
+def translate_tool(name: str, args: dict) -> tuple[str, dict, float]:
+    check_allowed_keys(args, name)
+    timeout = 180.0
+    if name == "remote_hosts":
+        return "hosts", {"config": str_arg(args, "config")}, 30.0
+    if name == "remote_bind":
+        return "bind", {
+            "repo": str_arg(args, "repo", required=True),
+            "scope": str_arg(args, "scope") or "checkout",
+            "host": str_arg(args, "host") or "",
+            "workspace": str_arg(args, "workspace") or "",
+            "gpus": int_list_arg(args, "gpus", non_empty=True),
+            "clear_gpus": bool_arg(args, "clear_gpus"),
+            "note": str_arg(args, "note"),
+            "paths": str_list_arg(args, "paths"),
+            "env_vars": env_map_arg(args, "env_vars"),
+            "unset_env": str_list_arg(args, "unset_env") or [],
+            "replace": bool_arg(args, "replace"),
+            "config": str_arg(args, "config"),
+        }, 30.0
+    if name == "remote_unbind":
+        return "unbind", {
+            "repo": str_arg(args, "repo", required=True),
+            "scope": str_arg(args, "scope") or "checkout",
+        }, 30.0
+    if name == "remote_config":
+        return "config", {
+            "repo": str_arg(args, "repo"),
+            "host": str_arg(args, "host"),
+            "workspace": str_arg(args, "workspace") or "",
+            "gpus": int_list_arg(args, "gpus", non_empty=True),
+            "no_gpu": bool_arg(args, "no_gpu"),
+            "paths": str_list_arg(args, "paths") or [],
+            "env_vars": env_map_arg(args, "env_vars"),
+            "max_untracked_mib": int_arg(args, "max_untracked_mib"),
+            "config": str_arg(args, "config"),
+        }, 30.0
+    if name == "remote_doctor":
+        return "doctor", {
+            "repo": str_arg(args, "repo"),
+            "host": str_arg(args, "host"),
+            "workspace": str_arg(args, "workspace") or "",
+            "paths": str_list_arg(args, "paths") or [],
+            "check_cmds": str_list_arg(args, "check_cmds") or [],
+            "session": str_arg(args, "session") or "",
+            "config": str_arg(args, "config"),
+        }, 90.0
+    if name == "remote_sync":
+        return "sync", {
+            "repo": str_arg(args, "repo", required=True),
+            "host": str_arg(args, "host"),
+            "workspace": str_arg(args, "workspace") or "",
+            "dry_run": bool_arg(args, "dry_run"),
+            "max_untracked_mib": int_arg(args, "max_untracked_mib"),
+            "config": str_arg(args, "config"),
+        }, 300.0
+    if name == "remote_exec":
+        repo = str_arg(args, "repo")
+        no_sync = bool_arg(args, "no_sync")
+        no_project = repo is None
+        if no_project and not no_sync:
+            raise ValueError("remote_exec requires 'repo' when no_sync is false; pass no_sync=true for ad-hoc runs")
+        # Reject explicit null or simultaneous key presence (matches JSON Schema `oneOf`).
+        has_argv_key = "argv" in args
+        has_shell_key = "shell" in args
+        if has_argv_key and has_shell_key:
+            raise ValueError("Provide either 'argv' OR 'shell', never both")
+        if not has_argv_key and not has_shell_key:
+            raise ValueError("Provide either non-empty 'argv' or non-empty 'shell'")
+        argv = str_list_arg(args, "argv") if has_argv_key else None
+        shell = str_arg(args, "shell", required=True) if has_shell_key else None
+        if has_argv_key and not argv:
+            raise ValueError("argv must be a non-empty array of strings")
+        shell_str = shell or ""
+        wait = num_arg(args, "wait", 15.0)
+        timeout = max(300.0, wait + 180.0)
+        return "exec", {
+            "repo": repo,
+            "host": str_arg(args, "host"),
+            "workspace": str_arg(args, "workspace") or "",
+            "remote_dir": str_arg(args, "remote_dir") or "",
+            "argv": argv,
+            "shell": shell_str,
+            "no_sync": no_sync,
+            "no_project": no_project,
+            "session": str_arg(args, "session") or "",
+            "wait": wait,
+            "gpus": int_list_arg(args, "gpus", non_empty=True),
+            "no_gpu": bool_arg(args, "no_gpu"),
+            "paths": str_list_arg(args, "paths") or [],
+            "env_vars": env_map_arg(args, "env_vars"),
+            "run_id": str_arg(args, "run_id") or "",
+            "tail_bytes": int_arg(args, "tail_bytes") if "tail_bytes" in args else 8192,
+            "raw_log": bool_arg(args, "raw_log"),
+            "max_untracked_mib": int_arg(args, "max_untracked_mib"),
+            "config": str_arg(args, "config"),
+            "emit_banner": False,
+        }, timeout
+    if name == "remote_status":
+        wait = num_arg(args, "wait", 0.0)
+        return "status", {
+            "run_id": str_arg(args, "run_id"),
+            "host": str_arg(args, "host"),
+            "repo": str_arg(args, "repo"),
+            "project": str_arg(args, "project") or "",
+            "wait": wait,
+            "offset": int_arg(args, "offset"),
+            "tail_bytes": int_arg(args, "tail_bytes") if "tail_bytes" in args else 8192,
+            "raw_log": bool_arg(args, "raw_log"),
+            "limit": int_arg(args, "limit", minimum=1) if "limit" in args else 20,
+            "config": str_arg(args, "config"),
+        }, max(90.0, wait + 60.0)
+    if name == "remote_cancel":
+        return "cancel", {
+            "run_id": str_arg(args, "run_id", required=True),
+            "host": str_arg(args, "host"),
+            "repo": str_arg(args, "repo"),
+            "config": str_arg(args, "config"),
+        }, 60.0
+    if name == "remote_pull":
+        return "pull", {
+            "run_id": str_arg(args, "run_id", required=True),
+            "destination": str_arg(args, "destination", required=True),
+            "host": str_arg(args, "host"),
+            "repo": str_arg(args, "repo"),
+            "max_file_mib": int_arg(args, "max_file_mib"),
+            "artifacts": str_list_arg(args, "artifacts") or [],
+            "paths": str_list_arg(args, "paths") or [],
+            "paths_only": bool_arg(args, "paths_only"),
+            "force": bool_arg(args, "force"),
+            "config": str_arg(args, "config"),
+        }, 600.0
+    if name == "remote_session":
+        action = str_arg(args, "action", required=True)
+        if action not in ("list", "reset"):
+            raise ValueError("action must be 'list' or 'reset'")
+        return "session", {
+            "action": action,
+            "name": str_arg(args, "name", required=(action == "reset")) or "",
+            "host": str_arg(args, "host"),
+            "repo": str_arg(args, "repo"),
+            "workspace": str_arg(args, "workspace") or "",
+            "remote_dir": str_arg(args, "remote_dir") or "",
+            "config": str_arg(args, "config"),
+        }, 60.0
+    if name == "remote_prune":
+        return "prune", {
+            "host": str_arg(args, "host"),
+            "repo": str_arg(args, "repo"),
+            "days": num_arg(args, "days", 14.0),
+            "apply": bool_arg(args, "apply"),
+            "verbose": bool_arg(args, "verbose"),
+            "config": str_arg(args, "config"),
+        }, 120.0
+    raise KeyError(f"Unknown tool: {name}")
+
+
+def call_tool(name: str, args: dict) -> dict:
+    op, params, timeout = translate_tool(name, args)
+    rc, stdout, stderr = run_service_subprocess(op, params, timeout=timeout)
+    if rc in (0, 2) and stdout:
+        try:
+            parsed = json.loads(stdout)
+            return {
+                "content": [{"type": "text", "text": json.dumps(parsed, ensure_ascii=False, indent=2)}],
+                "structuredContent": parsed,
+                "isError": rc == 2,
+            }
+        except json.JSONDecodeError:
+            pass
+    msg = stderr or stdout or f"{op} failed with exit code {rc}"
+    return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def handle_tool_call(req_id, params: dict, slot: RequestSlot, inflight: dict, lock: threading.Lock) -> None:
+    REQUEST.slot = slot
+    try:
+        name = params.get("name")
+        if not isinstance(name, str) or name not in TOOLS_BY_NAME:
+            err(req_id, -32602, f"Unknown tool: {name!r}")
+            return
+        result = call_tool(name, params.get("arguments") or {})
+        if not slot.cancelled.is_set():
+            ok(req_id, result)
+    except RequestCancelled:
+        pass
+    except (ValueError, KeyError) as exc:
+        if not slot.cancelled.is_set():
+            ok(req_id, {"content": [{"type": "text", "text": str(exc)}], "isError": True})
+    except Exception as exc:
+        if not slot.cancelled.is_set():
+            ok(req_id, {"content": [{"type": "text", "text": f"remote-run MCP error: {exc}"}], "isError": True})
+    finally:
+        REQUEST.slot = None
+        with lock:
+            if inflight.get(req_id) is slot:
+                inflight.pop(req_id, None)
+
+
+def _read_bounded_line(stream) -> tuple[bytes | None, bool]:
+    """Read one newline-delimited message bounded by MAX_REQUEST_BYTES without unbounded buffering."""
+    chunk = stream.readline(MAX_REQUEST_BYTES + 1)
+    if not chunk:
+        return None, False
+    if len(chunk) > MAX_REQUEST_BYTES and not chunk.endswith(b"\n"):
+        # Drain the remainder of the oversized line without holding it in memory.
+        while True:
+            extra = stream.readline(65536)
+            if not extra or extra.endswith(b"\n"):
+                break
+        return b"", True
+    return chunk, len(chunk) > MAX_REQUEST_BYTES
+
+
+def main() -> None:
+    general_pool = ThreadPoolExecutor(max_workers=8)
+    control_pool = ThreadPoolExecutor(max_workers=4)
+    cancel_pool = ThreadPoolExecutor(max_workers=4)
+    inflight: dict = {}
+    inflight_lock = threading.Lock()
+    interrupted = False
+    stdin_bin = sys.stdin.buffer
+    try:
+        while True:
+            raw_bytes, oversized = _read_bounded_line(stdin_bin)
+            if raw_bytes is None:
+                break
+            if oversized:
+                err(None, -32600, "Request too large")
                 continue
-            line = line.strip()
+            try:
+                line = raw_bytes.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                err(None, -32700, f"Invalid UTF-8: {exc}")
+                continue
             if not line:
                 continue
             try:
-                req = json.loads(line)
-            except (ValueError, RecursionError) as exc:
-                respond(None, error={"code": -32700, "message": f"Parse error: {exc}"})
+                msg = json.loads(line)
+            except json.JSONDecodeError as exc:
+                err(None, -32700, f"Parse error: {exc}")
                 continue
-            if not isinstance(req, dict) or req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str):
-                respond(None, error={"code": -32600, "message": "Invalid JSON-RPC request"})
+            if not isinstance(msg, dict):
+                err(None, -32600, "Invalid Request")
                 continue
-            msg_id = req.get("id")
-            method = req.get("method", "")
-            params = req.get("params") or {}
-            if not isinstance(params, dict):
-                params = {}
+            method = msg.get("method")
+            req_id = msg.get("id")
+            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+
+            if method == "notifications/initialized":
+                continue
             if method == "notifications/cancelled":
-                request_id = params.get("requestId")
-                if type(request_id) in (int, str) and request_id in pending:
-                    future, event = pending[request_id]
-                    event.set()
-                    if future.cancel():
-                        respond(request_id, tool_error("Request cancelled before launch"))
-                continue
-            if method == "notifications/initialized" or msg_id is None:
-                continue
-            if type(msg_id) not in (str, int):
-                respond(None, error={"code": -32600, "message": "Invalid JSON-RPC request ID"})
+                cancel_id = params.get("requestId")
+                if isinstance(cancel_id, (str, int)) and not isinstance(cancel_id, bool):
+                    with inflight_lock:
+                        slot = inflight.get(cancel_id)
+                    if slot is not None:
+                        # Mark cancelled immediately and terminate subprocess asynchronously so stdin loop never blocks.
+                        slot.cancelled.set()
+                        cancel_pool.submit(slot.cancel)
                 continue
             if method == "initialize":
-                req_ver = params.get("protocolVersion", "2024-11-05")
-                proto = req_ver if req_ver in SUPPORTED_PROTOCOLS else "2024-11-05"
-                respond(msg_id, {
+                if not isinstance(req_id, (str, int)) or isinstance(req_id, bool):
+                    err(None, -32600, "initialize requires a string or integer id")
+                    continue
+                req_ver = params.get("protocolVersion")
+                proto = req_ver if req_ver in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]
+                ok(req_id, {
                     "protocolVersion": proto,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "remote-run", "version": "0.5.0"},
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "remote-run", "version": __version__},
                 })
-            elif method == "ping":
-                respond(msg_id, {})
-            elif method == "tools/list":
-                respond(msg_id, {"tools": TOOLS})
-            elif method == "tools/call":
-                pending = {key: entry for key, entry in pending.items() if not entry[0].done()}
-                if msg_id in pending:
-                    respond(msg_id, error={"code": -32600, "message": "Request ID already active"})
+                continue
+            if method == "ping":
+                if not isinstance(req_id, (str, int)) or isinstance(req_id, bool):
+                    err(None, -32600, "ping requires a string or integer id")
                     continue
-                name = params.get("name")
-                control_tool = isinstance(name, str) and name in CONTROL_TOOLS
-                slots = control_capacity if control_tool else capacity
-                if not slots.acquire(blocking=False):
-                    respond(msg_id, tool_error("Server busy. Retry after another request finishes."))
+                ok(req_id, {})
+                continue
+            if method == "tools/list":
+                if not isinstance(req_id, (str, int)) or isinstance(req_id, bool):
+                    err(None, -32600, "tools/list requires a string or integer id")
                     continue
-                executor = control_pool if control_tool else pool
-                cancelled = threading.Event()
-                future = executor.submit(handle_tool_call, msg_id, params, cancelled)
-                pending[msg_id] = (future, cancelled)
-                future.add_done_callback(lambda _, semaphore=slots: semaphore.release())
-            else:
-                respond(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
+                ok(req_id, {"tools": TOOLS})
+                continue
+            if method == "tools/call":
+                if not isinstance(req_id, (str, int)) or isinstance(req_id, bool):
+                    err(None, -32600, "tools/call requires a string or integer id")
+                    continue
+                if "arguments" in params and not isinstance(params["arguments"], dict):
+                    err(req_id, -32602, "tools/call arguments must be a JSON object")
+                    continue
+                tool_name = params.get("name")
+                if not isinstance(tool_name, str) or tool_name not in TOOLS_BY_NAME:
+                    err(req_id, -32602, f"Unknown tool: {tool_name!r}")
+                    continue
+                with inflight_lock:
+                    if req_id in inflight:
+                        err(req_id, -32600, f"Duplicate in-flight request id: {req_id!r}")
+                        continue
+                    if len(inflight) >= MAX_PENDING:
+                        err(req_id, -32000, "Too many concurrent requests")
+                        continue
+                    slot = RequestSlot()
+                    inflight[req_id] = slot
+                pool = control_pool if tool_name in CONTROL_TOOLS else general_pool
+                pool.submit(handle_tool_call, req_id, params, slot, inflight, inflight_lock)
+                continue
+            if req_id is not None:
+                err(req_id, -32601, f"Method not found: {method}")
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        if interrupted:
+            with inflight_lock:
+                slots = list(inflight.values())
+            for slot in slots:
+                slot.cancel()
+            general_pool.shutdown(wait=True, cancel_futures=True)
+            control_pool.shutdown(wait=True, cancel_futures=True)
+            cancel_pool.shutdown(wait=True, cancel_futures=True)
+        else:
+            general_pool.shutdown(wait=True)
+            control_pool.shutdown(wait=True)
+            cancel_pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":

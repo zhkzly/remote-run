@@ -1,34 +1,23 @@
-# Optional project-level configuration for remote-run (<repo_root>/.remote-run.toml).
-# Delete any section you do not need; projects without this file run out of the box.
-schema_version = 1
+# <repo>/.remote-run.toml  (v2 — Committable, machine-agnostic project policy)
+# Keep personal host names, remote absolute paths, and GPU picks out of this file;
+# bind those privately on your laptop with `remote-run bind --scope repo ...`.
 
-# 1. Identity & Host/Env Defaults
-# project = "my-project"                  # Fixed remote project ID across local folder renames
-# host = "server"                         # Default host profile from hosts.toml
-# env = "venv"                            # "venv", "none", or a named env from hosts.toml
+schema_version = 2
+project = "polyglot-demo"                     # Stable remote project ID across folder renames
+path = ["build/bin", "node_modules/.bin"]     # Workspace-relative executable directories
 
-# 2. Workspace Isolation
-# Single-checkout repos default to "default" (keeps build caches across `git checkout -b`).
-# Linked Git worktrees isolate per checkout unless overridden here.
-# workspace = "default"
-# remote_dir = "/data/your-user/custom"   # Explicit remote dir override (cannot combine with [share].project)
+[env]                                         # Machine-agnostic literal environment variables
+NODE_ENV = "test"
+RUST_BACKTRACE = "1"
 
-# 3. Sync Policy
+[workspace]
+shared = ["tool-cache"]                       # Cross-worktree symlinked dirs under projects/<project>/shared/
+
 [sync]
-use_gitignore = true                      # Git ignore rules in checkouts, rsync exclude syntax in plain directories
-ignore = ["docs/", "papers/"]             # Paths excluded from upload and default ghost cleanup
-# Built-in workspace-root preserve: .venv, outputs, checkpoints, .cache
-preserve = ["target/", "build/", "reports/"]
+exclude = ["docs/generated/"]                 # Root-relative POSIX globs omitted on sender
+preserve = ["build", "node_modules", "target"]# Remote-owned dirs: never uploaded, never ghost-cleaned
+max_untracked_mib = 256                       # Language-neutral untracked upload guard (0 = unlimited)
 
-# 4. Shared Assets
-[share]
-# Project directories shared across linked Git worktrees via remote symlinks (auto-preserved):
-# project = ["cache", "assets"]
-# Host-level shared assets from hosts.toml ("name" or "alias=name"; injects env vars only, NO symlinks):
-# host = ["dataset-v1"]
-
-# 5. Runtime Environment Variables
-[env_vars]
-# Supports {run_id}, {host}, {device}, {artifacts}, {code}, {python},
-#          {git_commit}, {git_branch}, {shared.<alias>.path|version|sha256}
-# OUTPUT_DIR = "{artifacts}"
+[pull]
+max_file_mib = 10                             # Auto-pull artifact size limit in MiB (0 = unlimited)
+exclude = ["**/*.trace"]                      # Artifact-relative globs skipped unless pulled via --artifact

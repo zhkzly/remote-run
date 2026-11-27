@@ -1,105 +1,78 @@
-# remote-run Usage Guide
+# `remote-run` v2 Usage & Reference
 
-Use the CLI or stdio MCP to run commands on an SSH-configured Linux host. The project uses Python 3.11+ standard library. The remote host needs Bash, tmux and rsync already installed. The local host needs Bash, ssh and rsync on PATH. Git is optional for plain directories and supplies identity and ignore rules for Git checkouts. Remote Python 3.11+ must be available as `python3` to a plain noninteractive SSH command. Keep noninteractive shell stdout clear for rsync.
+All v2 configuration files require integer `schema_version = 2` and reject unknown keys immediately.
 
-## Configure a host
+## 1. Three-Layer Configuration & 4-Level Hierarchy
 
-Confirm its SSH host key and noninteractive authentication before running `init`. For an IPv6 host use an SSH config alias. Add `~/.local/bin` to your shell PATH when installing the two launchers.
+### Layer 1: Host Catalog (`$XDG_CONFIG_HOME/remote-run/hosts.toml`)
+Describes **machines only** (no project bindings or language-specific keys).
 
-```bash
-remote-run init my-server
-remote-run hosts
-remote-run doctor --check-cmd cargo --pretty
-```
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `schema_version` | int (`2`) | required | Strict v2 schema marker |
+| `default_host` | identifier | none | Optional default host alias (omittable when only 1 host exists) |
+| `[hosts.<name>].ssh` | string | required | OpenSSH alias from `~/.ssh/config` or `user@host` |
+| `[hosts.<name>].port` | int `1..65535` | OpenSSH default | Optional SSH port |
+| `[hosts.<name>].root` | remote path | `~/.local/share/remote-run-v2` | Level 1 remote state root |
+| `[hosts.<name>].path` | list[abs/`~/`] | `[]` | Machine-wide shared `PATH` prepends |
+| `[hosts.<name>.env]` | map[str, str] | `{}` | Machine-wide shared literal env vars |
+| `[hosts.<name>.gpu].devices` | list[int] | omitted (CPU-only) | Declared NVIDIA GPU indices |
+| `[hosts.<name>.gpu].locks_dir` | remote path | `<root>/locks` | Trusted `0700` lock directory |
 
-`init` probes tools before adding a host to `hosts.toml`. A CPU host works without a Python environment configuration or CUDA tools. For Python import and CUDA probes, configure or select a Python environment. A project venv probe needs `doctor --repo . --env venv` and an existing remote `.venv`.
+### Layer 2: Project Policy (`<repo>/.remote-run.toml`, Optional, Committable)
+Machine-agnostic policy shared across all developers and worktrees.
 
-```bash
-remote-run doctor --repo . --env pytorch --check-cuda --check-import torch
-```
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `schema_version` | int (`2`) | required | Strict v2 schema marker |
+| `project` | identifier | derived `p-<hash>` | Level 2 remote project directory (`projects/<project>`) |
+| `path` | list[rel dir] | `[]` | Workspace-relative executable dirs (e.g. `build/bin`, `node_modules/.bin`, `.venv/bin`) |
+| `[env]` | map[str, str] | `{}` | Machine-agnostic literal env vars |
+| `[workspace].shared` | list[rel dir] | `[]` | Cross-worktree symlinked dirs under `projects/<project>/shared/<rel>` |
+| `[sync].exclude` | list[glob] | `[]` | Root-relative POSIX sender exclusions (`*`, `?`, `**`, trailing `/` for dirs) |
+| `[sync].preserve` | list[rel dir] | `[]` | Remote-owned trees: never uploaded, never ghost-cleaned |
+| `[sync].max_untracked_mib` | int >= 0 | `256` | Language-neutral untracked upload guard (`0` disables) |
+| `[pull].max_file_mib` | int >= 0 | `10` | Automatic artifact size cap in MiB (`0` disables) |
+| `[pull].exclude` | list[glob] | `[]` | Artifact-relative globs skipped unless selected via `--artifact` |
 
-An existing non-empty remote root requires `doctor --init-root` after you verify it belongs to this tool. By default doctor inspects the root without creating it. Executable probes can run the configured interpreter, import modules or run NVIDIA diagnostics. Use trusted host and project configurations. Set `REMOTE_RUN_INHERIT_LOGIN_PATH=0` on the client to disable optional login PATH discovery. Remote Python bootstrap still uses the SSH command environment.
+### Layer 3: Private XDG Bindings (`$XDG_CONFIG_HOME/remote-run/bindings/<scope>-<sha256>.toml`)
+Managed via `remote-run bind` / `remote-run unbind` (zero modifications to the target repo):
+- **`--scope repo`** (keyed by canonical `git-common-dir`): inherited automatically by **every linked Git worktree**. Allowed keys: `schema_version`, `host`, `host_endpoint` (automatically recorded endpoint fingerprint `ssh|port|root`), `gpus`, `note`, `path`, `env`.
+- **`--scope checkout`** (keyed by canonical checkout root): applies to **this checkout/worktree only**, and also allows `workspace` (Level 3 directory `workspaces/<workspace>`).
+- **Cross-host safety**: Host-bound fields (`gpus`, `note`, `path`, `env`) require both `host` and `host_endpoint`. If you pass `--host other-box` or point the alias to a different endpoint, host-bound fields from the previous target are NOT applied (and reported under `skipped_bindings`), while checkout `workspace` remains portable.
 
-## Sync and workspace identity
+### Unified Precedence
+- **Host**: `--host` > checkout binding > repo binding > `default_host` > sole configured host.
+- **PATH** (leftmost = highest priority): `invocation --path` > `checkout binding` > `repo binding` > `project path` > `host path` > `remote noninteractive SSH PATH`.
+- **Env** (later wins, literal strings only): `SSH baseline` < `host env` < `project env` < `repo binding env` < `checkout binding env` < `saved session deltas` < `invocation --env` < `tool-owned` (`PATH`, `REMOTE_RUN_ID`, `REMOTE_RUN_HOST`, `REMOTE_RUN_WORKSPACE`, `REMOTE_RUN_ARTIFACTS`, and `CUDA_VISIBLE_DEVICES` on GPU hosts).
+- **GPUs**: `--no-gpu` / `--gpus` > `checkout binding` > `repo binding` > `[]` (CPU default).
 
-| Content | Default behavior |
-|---|---|
-| Source | rsync sends non-excluded files, including eligible untracked files. Same-path remote source can be replaced. |
-| Ignored | Git checkouts and initialized submodules use their Git ignore rules for untracked files. Plain directories use rsync exclude syntax in `.gitignore`. Built-in rsync excludes and `[sync].ignore` also apply. |
-| Local credentials | Common `.env` paths, `.ssh`, `.aws`, and the project `.remote-run.toml` are excluded. Put other local-only files in an ignore rule. |
-| Preserved | Workspace-root `.venv`, `outputs`, `checkpoints`, `.cache`, relative `[sync].preserve` paths and project shares are excluded and protected from managed cleanup. Add `target` or `build` to protect those caches independently of ignore patterns. |
-| Shared | `[share].project` mounts project directories into workspaces. `[share].host` supplies paths and optional checksum verification. Linux file permissions determine whether a program can write to the asset. |
+---
 
-Default ghost cleanup requires a previously uploaded regular file, a matching recorded remote version, and an absent local path that is outside the ignore and preserve rules. Old path-list manifests contain insufficient information for removal. An interrupted transfer can leave already copied files. A failed transfer does not advance the ownership manifest. Explicit `sync --delete` can delete unregistered files. Add remote-only paths to `[sync].preserve` to protect them. Git global excludes and `.git/info/exclude` are local to the sender. Use `sync --dry-run --delete` before applying it.
+## 2. Sync & Pull Guarantees
 
-A single checkout uses `default`. A linked Git worktree gets a separate workspace based on its checkout identity, including while detached (if `.git/worktrees/<id>` uses an opaque UUID or numeric ID, the readable prefix falls back to the checkout directory name while keeping the hash bound to the canonical worktree identity; upgrading from an earlier release that used the raw UUID prefix or renaming that local checkout directory changes the default workspace ID, so pin it with `--workspace` or `workspace = "..."` in `.remote-run.toml` if you intend to resume an existing remote directory). Existing workspaces from earlier branch-based naming stay where they are. Choose the old ID with `--workspace` if you intend to resume it. A submodule is discovered as its own Git checkout when invoked from inside it. The parent copy omits nested Git control files. Bare repositories are rejected. Set `project` for an empty Git history or to preserve identity across checkout renames.
+- **Zero language-specific `BUILTIN_IGNORE` or `BUILTIN_PRESERVE`**: Tracked files in `results/`, `outputs/`, etc. are synced normally unless explicitly excluded.
+- **Hard exclusions only**: `.git`, `.ssh`, `.aws`, `.env`, `.env.local`, `.env.*.local`, `.remote-run.toml`, control markers, and any in-repo XDG config/bindings directories.
+- **Single sender manifest**: Git checkouts use `git ls-files` (tracked + non-ignored untracked + initialized submodules) and send exact NUL-delimited paths to `rsync` without `-r` or `--delete`.
+- **Ghost cleanup**: Previously uploaded files/symlinks are removed only when absent locally and still matching their recorded remote snapshot; newly excluded or newly gitignored files still present locally are never deleted remotely.
+- **Type-neutral atomic `pull`**: No `.pt`/`.ckpt` suffix blacklist. Pull filters by recorded `[pull].max_file_mib` and `[pull].exclude`; `--artifact REL` fetches an exact artifact bypassing filters; `--path REL` fetches workspace or registered shared-dir files without `rsync -k` symlink traversal; publication is atomic.
 
-Sync refuses active workspaces and overlapping active paths. Writers using the same configured remote root serialize workspace preparation, upload and submission for overlapping paths. Use a linked worktree or a separate `--workspace` to build concurrently with a long run. Existing non-empty unmanaged directories require `sync --adopt` to accept uploads. Other processes with the same Linux account can change files outside this lock. Direct commands run with that account's filesystem permissions.
+---
 
-## Run, follow and recover
+## 3. CLI & MCP Command Reference
 
-```bash
-remote-run exec --follow -- cargo test
-remote-run exec --env venv -- uv run pytest -q
-remote-run exec --no-gpu --no-sync --remote-dir '~/datasets/v1' --shell 'hf download ...'
-remote-run exec --device cuda:0,1 -- torchrun --nproc_per_node=2 train.py
-```
-
-`--no-sync` skips upload and normally retains project settings. An implicit project workspace must already exist, except when a session creates its workspace. Passing `--no-sync --remote-dir <path>` without `--no-project` runs on an explicit directory (such as a host shared asset path) before the first sync while still keeping project `host`, `env`, and shared settings. From the local home directory or with explicit `--no-project --no-sync`, execution uses an ad hoc workspace under the remote root. Use a quoted `~/…` for remote home expansion. When calling MCP, always pass `repo` (even with `no_sync=true`) whenever project settings are needed.
-
-CPU is the default. A CUDA run takes one lock per physical index in sorted order and remaps the indices inside the child. A configured legacy `gpu_slot` adds another lock. While waiting for a busy GPU lock, `status` reports `status: "queued"`, `waiting_for_lock: true`, `blocked_by_runs` (active holder run IDs when known), and a queue-aware `next_action`; the run starts automatically once the lock is released. Run receipts expose the requested `physical_device` and report a CPU job as `device: cpu` (`REMOTE_RUN_DEVICE` for multi-GPU runs is a comma-separated logical list like `cuda:0,1`, not a single `torch.device` string). `--no-gpu` sets an empty `CUDA_VISIBLE_DEVICES` and skips card locks. The same applies to `--device cpu` on a CUDA-profile host. Locks coordinate jobs in the same lock directory. CUDA environment variables affect programs that honor them. Separate accounts and roots require a scheduling policy outside this tool.
-
-Jobs start in tmux. `--wait` is the local terminal wait window, default 15 seconds. `--wait 0` returns a submission receipt without logs. `--follow` streams from the beginning with original line breaks and terminal CR progress. `--raw-log` retains exact bytes in a terminal stream or in the snapshot field `log.data` (Base64). Log offsets count bytes. Commands receive EOF on stdin. Output buffering depends on the program. Do not pipe CLI JSON output through `| tail`; use `--tail-bytes` (or prefer MCP tools) so outer JSON fields like `run_id` are not truncated.
-
-```bash
-remote-run --host server status RUN_ID --wait 30 --print-log
-remote-run --host server status RUN_ID --follow
-remote-run status --repo . --limit 20
-remote-run --host server cancel RUN_ID
-```
-
-The CLI reports the submission identity to stderr before waiting. Ctrl-C stops the local wait. A job already submitted continues until completion or explicit cancellation. `cancel` signals the verified process group and reports whether cancellation was requested. A legacy job without process identity can be cancelled through its tmux session, with confirmation based on observed liveness. Shell commands should wait for work they spawn. Processes that leave the group require their own lifecycle management.
-
-A persistent session serializes jobs with the same name and workspace. Successful Bash exits save cwd and exported environment changes, including unsets. Replacing the shell or its exit trap can skip session capture. Reset returns an error while the session is active.
-
-```bash
-remote-run exec --session dev --shell 'cd sub && export TAG=v1'
-remote-run exec --session dev --no-sync --shell 'pwd && echo "$TAG"'
-remote-run session list --repo .
-remote-run session reset dev
-```
-
-## Pull and prune
-
-```bash
-remote-run pull RUN_ID ./results/RUN_ID
-remote-run pull RUN_ID ./results/RUN_ID --path reports/bench.md --paths-only --force
-remote-run prune --days 14
-remote-run prune --days 14 --apply
-```
-
-`pull` defaults to a new destination and copies state, log and eligible artifacts. A 10 MiB per-file limit and checkpoint suffix exclusions apply to automatic artifact selection. `--max-file-mb 0` disables the size check. `--all-artifacts` removes both artifact filters. Explicit `--path` uses workspace and shared-root validation, excludes internal control paths, places pulled files under `<destination>/workspace/` (reported as `workdir_destination` in the receipt), and is independent of the artifact filters. Write primary outputs and small index files into `$REMOTE_RUN_ARTIFACTS` when possible so a single `pull` captures everything; pass `--paths-only` when fetching workspace files separately so logs and artifacts are not downloaded twice. Use `--force` to merge into an existing destination. Configured environment values are redacted in host, config and session inspection. The private worker request is outside the default pull set. Logs and user-created artifacts can contain values printed or written by the job.
-
-`prune` previews by default and requires `--apply` to delete. It verifies directory and run ownership, skips busy entries and operates on positively identified terminal runs. Legacy jobs without a run ownership marker remain accessible and are skipped by prune.
-
-## CLI and MCP reference
-
-CLI common flags are `--config PATH`, `--host NAME`, and `--pretty`. Host selection starts with the explicit host, then the applicable project host, then the global default. `hosts` lists all profiles and `init` selects its target positionally. MCP uses `config` and, where applicable, `host`. MCP tools return one text content item containing the CLI JSON on success, and include `isError` when the CLI fails. Long-lived `remote-run-mcp` stdio processes do not hot-reload; restart the MCP client session after upgrading `remote-run`.
-
-| CLI command and options | MCP tool and differences |
-|---|---|
-| `hosts` | `remote_hosts` with optional `config`. |
-| `init TARGET` with `--name`, `--port`, `--root`, `--default`, `--force` | CLI only. |
-| `config` with `--repo`, `--remote-dir`, `--workspace` | `remote_config` requires `repo`. CLI defaults to cwd. Inspection leaves Git dirty state uncomputed. |
-| `doctor` with `--repo`, `--env`, repeatable `--shared`, `--check-cmd`, `--check-import`, `--check-cuda`, `--init-root` | `remote_doctor` exposes `check_cmds` and `check_imports` as arrays and supports `check_cuda`. Root claiming is CLI only. |
-| `sync` with `--repo`, `--remote-dir`, `--workspace`, `--dry-run`, `--delete`, `--adopt` | `remote_sync` requires `repo` and omits explicit deletion and adoption. Default sync can still change or remove source files. |
-| `exec` with `--repo`, `--remote-dir`, `--workspace`, `--no-sync`, `--no-project`, `--session`, `--device`, `--no-gpu`, `--env`, repeatable `--shared`, `--env-var`, `--run-id`, `--wait`, `--tail-bytes`, `--raw-log`, `--follow`, `--print-log`, and either `--shell` or `-- COMMAND…` | `remote_exec` requires exactly one of `command` (argv array) and `shell`. `shared` is an array, `env_vars` a string map. `repo` is required for upload and still recommended with `no_sync=true` when applying `.remote-run.toml`. `no_project` requires `no_sync`. `--follow` and `--print-log` are CLI only. |
-| `status [RUN_ID]` with `--repo`, `--project`, `--limit`, `--wait`, `--offset`, `--tail-bytes`, `--raw-log`, `--follow`, `--print-log` | `remote_status` exposes `run_id` and all snapshot and listing fields (keep MCP `wait` short, e.g. `0-60`s). `--follow` and `--print-log` are CLI only. Listing defaults to 20. Byte offset and wait apply to a specific run. |
-| `cancel RUN_ID` | `remote_cancel` requires `run_id`. |
-| `pull RUN_ID DEST` with `--all-artifacts`, `--max-file-mb`, repeatable `--path`, `--paths-only`, `--force` | `remote_pull` requires `run_id` and `destination`, with an array `paths` (placed under `<destination>/workspace/`, reported as `workdir_destination`). `paths_only` requires at least one path. |
-| `session list`, `session reset NAME` with `--repo`, `--remote-dir`, `--workspace` | `remote_session` requires `action` and requires `name` for reset. A reset without path options targets the current project workspace. |
-| `prune` with `--days`, `--apply` | `remote_prune` defaults to 14 days and preview. Applying requires a JSON boolean `true`. |
-
-Run log snapshots default to 8192 bytes. `--tail-bytes 0` reads to the end. `--follow` streams the full log instead of applying snapshot wait and offset options. CLI `--print-log` and `--follow` send metadata to stderr. Otherwise the receipt is JSON on stdout. `exec` and `status --follow` exit 2 for failed, cancelled or interrupted runs. Ordinary `status` exits 0 when the inspection succeeds. Argument syntax errors and doctor missing-command/import checks may also exit 2. Local and SSH runtime errors exit 1. Interrupting a CLI run or follow exits 130. Cancelling an MCP request stops its local CLI process. Use `remote_cancel` to cancel an already submitted job.
-
-See [the schema and Agent setup guide](../skills/remote-run/references/schema-and-setup.md) for both TOML files.
+| CLI Subcommand | MCP Tool | Purpose |
+| --- | --- | --- |
+| `remote-run hosts` | `remote_hosts` | List configured hosts (env values redacted) |
+| `remote-run init <target>` | — | Probe SSH target and write `hosts.toml` entry |
+| `remote-run bind --scope repo\|checkout ...` | `remote_bind` | Create/update private XDG binding |
+| `remote-run unbind --scope repo\|checkout` | `remote_unbind` | Remove private XDG binding |
+| `remote-run config` | `remote_config` | Inspect merged workspace, PATH layers, env origins, note, GPUs, sync/pull policies |
+| `remote-run doctor --check-cmd ...` | `remote_doctor` | Strictly read-only check of SSH, tools, PATH layers, bare/literal commands, GPUs |
+| `remote-run sync [--dry-run]` | `remote_sync` | Manifest sync with untracked budget guard and ghost cleanup |
+| `remote-run exec [-- CMD \| --shell STR]` | `remote_exec` | Sync (optional) and run `argv` xor `shell` (CPU default; `--gpus` opt-in) |
+| `remote-run status [RUN_ID]` | `remote_status` | List recent runs or inspect status + UTF-8-aligned log slice (pass `--host` from receipt or `--repo`) |
+| `remote-run cancel RUN_ID` | `remote_cancel` | Cancel running/queued job and wait for process group termination (pass `--host` from receipt or `--repo`) |
+| `remote-run pull RUN_ID DEST` | `remote_pull` | Atomically pull logs, eligible artifacts, `--artifact`, or `--path` (pass `--host` from receipt or `--repo`) |
+| `remote-run session list\|reset` | `remote_session` | Inspect or reset opt-in persistent shell sessions |
+| `remote-run prune [--days N] [--apply] [--verbose]` | `remote_prune` | Dry-run or delete old terminal runs with `skipped_unmanaged_count` summary (pass `--host` or `--repo`) |
