@@ -40,7 +40,7 @@ Local editing stays on the laptop. When `remote_*` MCP tools are already loaded 
    - Single checkouts use `default`. Linked Git worktrees isolate per checkout and share `[share].project`. Sync rejects a workspace with active jobs. Add build caches to `[sync].preserve` explicitly.
    - CPU jobs skip card locks. `--no-gpu` clears `CUDA_VISIBLE_DEVICES`. A CUDA job takes sorted per-card locks and any configured legacy lock. Coordination is scoped to the lock directory.
    - **Environments**: uses project `env` or host `default_env`, or pass `--env <name>` / `--env venv` (`<workdir>/.venv/bin`) / `--env none`.
-   - `exec` and `status --follow` exit 2 for terminal task failures. Plain status exits 0 on successful inspection. Detach exits 0, runtime and SSH errors exit 1, and Ctrl-C stops the local wait with 130. Follow streams stdout and places metadata on stderr.
+   - `exec` and `status --follow` exit 2 for terminal task failures. Plain status exits 0 on successful inspection. Detach exits 0, runtime and SSH errors exit 1, and Ctrl-C stops the local wait with 130. Follow streams stdout and places metadata on stderr. Do **not** pipe CLI `exec` / `status` JSON output through `| tail` (it truncates outer JSON and `run_id`); pass `--tail-bytes <N>` or prefer MCP tools.
    ```bash
    remote-run exec --follow -- cargo test
    remote-run exec --env venv -- uv run pytest -q
@@ -65,7 +65,7 @@ Local editing stays on the laptop. When `remote_*` MCP tools are already loaded 
      ```
 
 3. **Environment variables injected on the remote host**:
-   - `REMOTE_RUN_ID`, `REMOTE_RUN_HOST`, `REMOTE_RUN_DEVICE` (`cpu`, `cuda:0`, or `cuda:0,1,...`), `REMOTE_RUN_ARTIFACTS` (per-run artifact dir), `REMOTE_RUN_CODE` (remote workspace), `REMOTE_RUN_PYTHON`
+   - `REMOTE_RUN_ID`, `REMOTE_RUN_HOST`, `REMOTE_RUN_DEVICE` (`cpu`, `cuda:0`, or comma-separated logical indices `cuda:0,1,...` for multi-GPU — pass single-GPU values to `torch.device`, but parse `CUDA_VISIBLE_DEVICES` / `torch.cuda.device_count()` for multi-GPU instead of passing a comma list to `torch.device()`), `REMOTE_RUN_ARTIFACTS` (per-run artifact dir), `REMOTE_RUN_CODE` (remote workspace), `REMOTE_RUN_PYTHON`
    - `REMOTE_RUN_GIT_COMMIT` (40-hex `HEAD`), `REMOTE_RUN_GIT_BRANCH`, `REMOTE_RUN_GIT_DIRTY` (`1`/`0`)
    - Bound host shared assets (`--shared [ALIAS=]NAME` or `[share].host`): `REMOTE_RUN_SHARED_<ALIAS>_PATH`, `_NAME`, `_VERSION`, `_SHA256`
 
@@ -73,7 +73,7 @@ Local editing stays on the laptop. When `remote_*` MCP tools are already loaded 
    - Run statuses: `queued`, `running`, and terminal states `completed`, `failed`, `cancelled`, `interrupted`.
    - When `status == "queued"` and `waiting_for_lock == true`, the run is already queued behind another GPU job (`blocked_by_runs` lists the active holder run IDs when known) and will start automatically once the lock is released — wait via `status RUN_ID --wait ...` instead of cancelling or resubmitting.
    - When `detached: true`, immediately report `run_id`, `host`, `device`, `workdir`, `tmux_session`, and `next_action`.
-   - For long jobs in background-capable harnesses, run `remote-run status RUN_ID --wait 3600` in the background (or `remote-run status RUN_ID --follow` in interactive CLI). When polling manually, pass `--offset <next_offset>`.
+   - For long jobs in background-capable harnesses, CLI background waits can run `remote-run status RUN_ID --wait 3600` (or `remote-run status RUN_ID --follow` in interactive CLI). For **MCP `remote_status`**, keep `wait` short (`0-60`s) and monitor via `offset` polling or harness timers to avoid client MCP timeouts. Always pass `--offset <next_offset>` when polling manually.
    ```bash
    remote-run status RUN_ID --wait 30
    remote-run status RUN_ID --follow
@@ -84,7 +84,7 @@ Local editing stays on the laptop. When `remote_*` MCP tools are already loaded 
    remote-run sync --dry-run --delete
    remote-run prune --days 14                     # dry-run; ask user before --apply
    ```
-   - `pull` applies checkpoint suffix and 10 MiB per-file limits to automatically selected artifacts. Explicit workspace paths are independent. Private request metadata is excluded from default pull. Prune skips jobs without a run ownership marker.
+   - `pull` applies checkpoint suffix and 10 MiB per-file limits to automatically selected artifacts. Write primary outputs and small run index/manifest files into `$REMOTE_RUN_ARTIFACTS` so a single `pull` captures everything. Explicit `--path` / `paths` workspace files are saved under `<destination>/workspace/<rel>` (reported as `workdir_destination`) and are independent of artifact filters; add `--paths-only` / `paths_only=true` when fetching workspace files separately so logs and artifacts are not downloaded twice. Private request metadata is excluded from default pull. Prune skips jobs without a run ownership marker.
 
 ## 2. Optional 2-File Config & Multi-Harness Setup
 

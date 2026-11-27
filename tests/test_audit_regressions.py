@@ -323,3 +323,90 @@ class AuditRegressions(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "No remote workspace"):
                     rr.handle_exec(args, host, repo, "", rr.empty_project_config())
             self.assertEqual(stderr.getvalue(), "")
+
+    def test_opaque_linked_worktree_uses_checkout_name_with_stable_hash(self):
+        self.assertTrue(rr.is_opaque_worktree_name("1073435-060f401f-8538-4acf-8a2b-af9fbd590505"))
+        self.assertTrue(rr.is_opaque_worktree_name("060f401f-8538-4acf-8a2b-af9fbd590505"))
+        self.assertTrue(rr.is_opaque_worktree_name("123456789"))
+        self.assertTrue(rr.is_opaque_worktree_name("0123456789abcdef0123"))
+        self.assertFalse(rr.is_opaque_worktree_name("soil-physics-exp"))
+        self.assertFalse(rr.is_opaque_worktree_name("wt1"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            common = (base / "repo" / ".git").resolve()
+            opaque_wt_dir = common / "worktrees" / "1073435-060f401f-8538-4acf-8a2b-af9fbd590505"
+            named_wt_dir = common / "worktrees" / "feat-box"
+            checkout_named = (base / "app-main").resolve()
+            checkout_opaque = (base / "99887766").resolve()
+            for p in (opaque_wt_dir, named_wt_dir, checkout_named, checkout_opaque):
+                p.mkdir(parents=True)
+
+            host = {"root": "/data/jobs"}
+            cfg = rr.empty_project_config()
+            cfg["project"] = "proj-x"
+
+            def fake_git(git_dir):
+                def _query(argv, cwd=None):
+                    if argv[:2] == ["rev-list", "--max-parents=0"]:
+                        return True, "deadbeef1234"
+                    if argv == ["rev-parse", "HEAD"]:
+                        return True, "a" * 40
+                    if argv == ["status", "--porcelain"]:
+                        return True, ""
+                    if argv == ["symbolic-ref", "--short", "HEAD"]:
+                        return True, "feat/box"
+                    if argv == ["rev-parse", "--git-dir"]:
+                        return True, str(git_dir)
+                    if argv == ["rev-parse", "--git-common-dir"]:
+                        return True, str(common)
+                    return False, ""
+                return _query
+
+            expected_opaque_tag = sha256(b"worktrees/1073435-060f401f-8538-4acf-8a2b-af9fbd590505").hexdigest()[:12]
+            with mock.patch.object(rr, "git_query", side_effect=fake_git(opaque_wt_dir)):
+                ws_opaque = rr.resolve_workspace(checkout_named, cfg, host, in_git=True)
+            self.assertEqual(ws_opaque["workspace_id"], f"wt-app-main-{expected_opaque_tag}")
+
+            with mock.patch.object(rr, "git_query", side_effect=fake_git(opaque_wt_dir)):
+                ws_both_opaque = rr.resolve_workspace(checkout_opaque, cfg, host, in_git=True)
+            self.assertEqual(
+                ws_both_opaque["workspace_id"],
+                f"wt-1073435-060f401f-8538-4acf-8a2b-af9fbd5905-{expected_opaque_tag}",
+            )
+
+            expected_named_tag = sha256(b"worktrees/feat-box").hexdigest()[:12]
+            with mock.patch.object(rr, "git_query", side_effect=fake_git(named_wt_dir)):
+                ws_named = rr.resolve_workspace(checkout_named, cfg, host, in_git=True)
+            self.assertEqual(ws_named["workspace_id"], f"wt-feat-box-{expected_named_tag}")
+
+    def test_pull_reports_workdir_destination_only_when_workdir_files_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            host = {"root": "/tmp/remote", "ssh": "unused"}
+
+            dest_no_wd = base / "pull-only-job"
+            args1 = SimpleNamespace(
+                destination=dest_no_wd, force=False, max_file_mb=10.0, path=[],
+                all_artifacts=False, run_id="rr-1", paths_only=False,
+            )
+            with mock.patch.object(rr, "ssh_call", return_value={"job_files": [], "workdir_files": []}), \
+                 mock.patch.object(rr, "rsync_protect_args", return_value=[]), \
+                 mock.patch.object(rr, "build_ssh_argv", return_value=["unused"]), \
+                 mock.patch.object(rr, "run"):
+                res1 = rr.handle_pull(args1, host)
+            self.assertNotIn("workdir_destination", res1)
+
+            dest_with_wd = base / "pull-with-wd"
+            args2 = SimpleNamespace(
+                destination=dest_with_wd, force=False, max_file_mb=10.0, path=["out/res.tsv"],
+                all_artifacts=False, run_id="rr-2", paths_only=True,
+            )
+            with mock.patch.object(rr, "ssh_call", return_value={
+                     "job_files": [], "workdir_files": ["out/res.tsv"], "workdir": "/tmp/remote/ws",
+                 }), \
+                 mock.patch.object(rr, "rsync_protect_args", return_value=[]), \
+                 mock.patch.object(rr, "build_ssh_argv", return_value=["unused"]), \
+                 mock.patch.object(rr, "run"):
+                res2 = rr.handle_pull(args2, host)
+            self.assertEqual(res2["workdir_destination"], str(dest_with_wd.resolve() / "workspace"))

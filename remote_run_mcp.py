@@ -122,7 +122,7 @@ TOOLS = [
             "properties": {
                 "host": {"type": "string", "description": "Optional host name override"},
                 "run_id": {"type": "string", "description": "Run ID to inspect (omit to list recent runs)"},
-                "wait": {"type": "number", "description": "Seconds to wait for terminal status"},
+                "wait": {"type": "number", "description": "Seconds to wait for terminal status (keep short in MCP, e.g. 0-60s, to avoid client tool-call timeouts; poll or use timers for longer runs)"},
                 "offset": {"type": "integer", "description": "Byte offset to read log from"},
                 "tail_bytes": {"type": "integer", "description": "Max log bytes to return"},
                 "raw_log": {"type": "boolean", "description": "Disable carriage-return folding"},
@@ -152,7 +152,7 @@ TOOLS = [
     },
     {
         "name": "remote_pull",
-        "description": "Pull logs, metadata, eligible artifacts, and optional workspace paths to a local directory.",
+        "description": "Pull logs, metadata, eligible artifacts, and optional workspace paths (saved under <destination>/workspace/) to a local directory.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -161,7 +161,7 @@ TOOLS = [
                 "destination": {"type": "string", "description": "Local destination path (must not exist unless force=true)"},
                 "all_artifacts": {"type": "boolean", "description": "Include checkpoint files and artifacts exceeding max_file_mb"},
                 "max_file_mb": {"type": "number", "description": "Max artifact size in MB when all_artifacts=false"},
-                "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative paths inside remote workspace to pull"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Relative paths inside remote workspace to pull (saved under <destination>/workspace/<path>, reported as workdir_destination)"},
                 "paths_only": {"type": "boolean", "description": "Pull only requested workspace paths without re-fetching job logs/artifacts (requires paths)"},
                 "force": {"type": "boolean", "description": "Merge pulled files into an existing destination directory without deleting other files"},
                 "config": {"type": "string", "description": "Optional path to hosts.toml"},

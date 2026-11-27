@@ -753,6 +753,9 @@ class RemoteRunTests(unittest.TestCase):
             self.assertFalse(tools["remote_doctor"]["annotations"]["readOnlyHint"])
             self.assertFalse(tools["remote_doctor"]["annotations"]["destructiveHint"])
             self.assertIn("no_sync", tools["remote_exec"]["inputSchema"]["properties"]["repo"]["description"])
+            self.assertIn("0-60", tools["remote_status"]["inputSchema"]["properties"]["wait"]["description"])
+            self.assertIn("workspace", tools["remote_pull"]["inputSchema"]["properties"]["paths"]["description"])
+            self.assertIn("workdir_destination", tools["remote_pull"]["inputSchema"]["properties"]["paths"]["description"])
             self.assertTrue(tools["remote_exec"]["annotations"]["destructiveHint"])
             self.assertTrue(tools["remote_pull"]["annotations"]["destructiveHint"])
             sync_props = tools["remote_sync"]["inputSchema"]["properties"]

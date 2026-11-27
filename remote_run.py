@@ -715,6 +715,16 @@ def load_project_config(repo_root):
     }
 
 
+def is_opaque_worktree_name(name):
+    return bool(
+        re.fullmatch(
+            r"(?:[0-9]+[-_])?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            name,
+        )
+        or re.fullmatch(r"[0-9a-fA-F]{16,}|[0-9]+", name)
+    )
+
+
 def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
                       workspace_override="", remote_dir_override="", ignore_share_project=False,
                       inspect_dirty=True):
@@ -772,7 +782,12 @@ def resolve_workspace(repo_root, proj_cfg, host, *, rel_subdir="", in_git=False,
     elif in_git and is_linked_worktree:
         worktree_id = g_res.relative_to(common_dir_path).as_posix()
         tag = sha256(worktree_id.encode()).hexdigest()[:12]
-        workspace_id = f"wt-{sanitize_id(g_res.name[:42], 'worktree')}-{tag}"
+        label = repo_root.name if (
+            is_opaque_worktree_name(g_res.name)
+            and repo_root.name
+            and not is_opaque_worktree_name(repo_root.name)
+        ) else g_res.name
+        workspace_id = f"wt-{sanitize_id(label[:42], 'worktree')}-{tag}"
     else:
         workspace_id = "default"
 
@@ -3057,7 +3072,10 @@ def handle_pull(args, host):
                     (dest / name).rename(contents / name)
                 dest.rmdir()
                 raise
-    return {"run_id": args.run_id, "destination": str(dest), **meta}
+    result = {"run_id": args.run_id, "destination": str(dest), **meta}
+    if meta.get("workdir_files"):
+        result["workdir_destination"] = str(dest / "workspace")
+    return result
 
 
 def infer_cwd_project_host():
