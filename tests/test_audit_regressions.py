@@ -274,34 +274,115 @@ class AuditRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "remote"
             runs = root / "runs"
+            locks_main = root / "locks"
+            locks_other = root / "other-locks"
             holder = runs / "rr-holder"
+            other_locks_holder = runs / "rr-other-locks"
+            malformed = runs / "rr-malformed"
             waiter = runs / "rr-waiter"
-            holder.mkdir(parents=True)
-            waiter.mkdir(parents=True)
+            for d in (holder, other_locks_holder, malformed, waiter):
+                d.mkdir(parents=True)
             rr.write_json(holder / "request.json", {
                 "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
-                "use_gpu": True, "gpu_slots": ["gpu-0"], "workdir": str(root / "w1"),
+                "locks_dir": str(locks_main), "use_gpu": True, "gpu_slots": ["gpu-0"],
+                "workdir": str(root / "w1"),
             })
             rr.write_json(holder / "state.json", {
                 "run_id": "rr-holder", "status": "running", "waiting_for_lock": False,
                 "worker_pid": os.getpid(), "started_at": rr.now(),
             })
+            rr.write_json(other_locks_holder / "request.json", {
+                "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
+                "locks_dir": str(locks_other), "use_gpu": True, "gpu_slots": ["gpu-0"],
+                "workdir": str(root / "w-other"),
+            })
+            rr.write_json(other_locks_holder / "state.json", {
+                "run_id": "rr-other-locks", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
+            rr.write_json(malformed / "request.json", {
+                "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
+                "locks_dir": str(locks_main), "use_gpu": True, "gpu_slots": [["gpu-0"]],
+                "workdir": str(root / "w-bad"),
+            })
+            rr.write_json(malformed / "state.json", {
+                "run_id": "rr-malformed", "status": "running", "waiting_for_lock": False,
+                "worker_pid": os.getpid(), "started_at": rr.now(),
+            })
             rr.write_json(waiter / "request.json", {
                 "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
-                "use_gpu": True, "gpu_slots": ["gpu-0"], "workdir": str(root / "w2"),
+                "locks_dir": str(locks_main), "use_gpu": True, "gpu_slots": ["gpu-0"],
+                "workdir": str(root / "w2"),
             })
             rr.write_json(waiter / "state.json", {
                 "run_id": "rr-waiter", "status": "queued", "waiting_for_lock": True,
                 "worker_pid": os.getpid(), "submitted_at": rr.now(),
             })
-            with mock.patch.object(rr, "run_process_alive", return_value=True):
+            with mock.patch.object(rr, "run_process_alive", return_value=True), \
+                 mock.patch.object(rr, "tmux_program", return_value="/unused/tmux"), \
+                 mock.patch.object(rr.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
                 st = rr.state_of(waiter, root)
+                cancel_res = rr.remote_cancel(root, waiter)
             self.assertEqual(st["blocked_by_runs"], ["rr-holder"])
+            self.assertEqual(cancel_res["blocked_by_runs"], ["rr-holder"])
             msg = rr.continuation({"name": "desktop"}, "rr-waiter", state=st)
             self.assertIn("Queued waiting for GPU lock", msg)
             self.assertIn("rr-holder", msg)
 
-    def test_failed_submit_does_not_print_ghost_run_banner_to_stderr(self):
+    def test_worker_does_not_mark_session_lock_wait_as_gpu_lock_wait(self):
+        import fcntl
+        import time
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "remote"
+            ws = root / "ws"
+            ws.mkdir(parents=True)
+            sdir = root / "sessions"
+            sdir.mkdir(parents=True)
+            skey = rr.session_key_for(str(ws), "dev")
+            job = root / "runs" / "rr-sess-wait"
+            (job / "artifacts").mkdir(parents=True)
+            rr.write_json(job / "request.json", {
+                "host": "desktop", "device": "cuda:0", "physical_device": "cuda:0",
+                "gpu_slot": "", "gpu_slots": ["gpu-0"], "locks_dir": str(root / "locks"),
+                "use_gpu": True, "env_name": "none", "python": "", "auto_venv": False,
+                "path_prepend": [], "env_static": {}, "env_vars": {}, "shared": {},
+                "workdir": str(ws), "shared_dir": "", "rel_subdir": "",
+                "project_id": "p", "workspace_id": "main", "session": "dev", "session_key": skey,
+                "command": ["true"], "shell": "",
+            })
+            rr.write_json(job / "state.json", {
+                "run_id": "rr-sess-wait", "status": "queued", "waiting_for_lock": False,
+                "submitted_at": rr.now(),
+            })
+
+            errors = []
+            with mock.patch.object(rr.signal, "signal"):
+                with rr.open_lock(sdir / f"{skey}.lock") as held_slock:
+                    fcntl.flock(held_slock, fcntl.LOCK_EX)
+                    t = threading.Thread(target=lambda: errors.append(rr.worker(root, job)))
+                    t.start()
+                    deadline = time.monotonic() + 2.0
+                    seen_pid = False
+                    while time.monotonic() < deadline:
+                        cur = rr.read_json(job / "state.json")
+                        if "worker_pid" in cur:
+                            seen_pid = True
+                            break
+                        time.sleep(0.02)
+                    self.assertTrue(seen_pid)
+                    time.sleep(0.1)
+                    during_session_wait = rr.read_json(job / "state.json")
+                    self.assertEqual(during_session_wait["status"], "queued")
+                    self.assertFalse(during_session_wait["waiting_for_lock"])
+                t.join(5.0)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(errors, [None])
+            final_state = rr.read_json(job / "state.json")
+            self.assertEqual(final_state["status"], "completed")
+            self.assertFalse(final_state["waiting_for_lock"])
+
+    def test_failed_submit_and_interrupt_timing_stderr(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
@@ -323,6 +404,25 @@ class AuditRegressions(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "No remote workspace"):
                     rr.handle_exec(args, host, repo, "", rr.empty_project_config())
             self.assertEqual(stderr.getvalue(), "")
+
+            stderr_sub = io.StringIO()
+            with mock.patch.object(rr, "workspace_lease", return_value=mock.MagicMock(__enter__=lambda s: None, __exit__=lambda *a: False)), \
+                 mock.patch.object(rr, "ssh_call", side_effect=KeyboardInterrupt()), \
+                 mock.patch.object(sys, "stderr", stderr_sub):
+                with self.assertRaises(SystemExit) as cm:
+                    rr.handle_exec(args, host, repo, "", rr.empty_project_config())
+            self.assertEqual(cm.exception.code, 130)
+            self.assertIn("rr-ghost-check", stderr_sub.getvalue())
+            self.assertIn("unconfirmed", stderr_sub.getvalue())
+            self.assertIn("cancel rr-ghost-check", stderr_sub.getvalue())
+
+            stderr_pre = io.StringIO()
+            with mock.patch.object(rr, "workspace_lease", side_effect=KeyboardInterrupt()), \
+                 mock.patch.object(sys, "stderr", stderr_pre):
+                with self.assertRaises(SystemExit) as cm2:
+                    rr.handle_exec(args, host, repo, "", rr.empty_project_config())
+            self.assertEqual(cm2.exception.code, 130)
+            self.assertNotIn("rr-ghost-check", stderr_pre.getvalue())
 
     def test_opaque_linked_worktree_uses_checkout_name_with_stable_hash(self):
         self.assertTrue(rr.is_opaque_worktree_name("1073435-060f401f-8538-4acf-8a2b-af9fbd590505"))

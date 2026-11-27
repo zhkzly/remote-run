@@ -1067,17 +1067,38 @@ def ensure_root_owned(root, *, init_root=False, dry_run=False):
     write_json(marker, {"schema_version": 1, "created_at": now()})
 
 
+def valid_gpu_slots(raw):
+    if not isinstance(raw, list):
+        return set()
+    return {slot for slot in raw if isinstance(slot, str) and slot}
+
+
+def resolved_locks_dir(req):
+    raw = req.get("locks_dir")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return Path(expand_remote_path(raw, "locks_dir")).resolve()
+    except (ValueError, OSError):
+        return None
+
+
 def queue_holder_runs(root, job, req):
-    if not req.get("use_gpu"):
-        return []
-    wanted = set(req.get("gpu_slots") or [])
-    if not wanted:
-        return []
-    runs_dir = root / "runs"
-    if not runs_dir.is_dir():
+    try:
+        if not isinstance(req, dict) or not req.get("use_gpu"):
+            return []
+        wanted = valid_gpu_slots(req.get("gpu_slots"))
+        target_locks = resolved_locks_dir(req)
+        if not wanted or target_locks is None:
+            return []
+        runs_dir = root / "runs"
+        if not runs_dir.is_dir():
+            return []
+        children = sorted(runs_dir.iterdir())
+    except OSError:
         return []
     holders = []
-    for child in sorted(runs_dir.iterdir()):
+    for child in children:
         if child.name == job.name or not child.is_dir() or child.is_symlink():
             continue
         if not (child / "state.json").is_file() or not (child / "request.json").is_file():
@@ -1086,7 +1107,10 @@ def queue_holder_runs(root, job, req):
             other_req = read_json(child / "request.json")
             if not isinstance(other_req, dict) or not other_req.get("use_gpu"):
                 continue
-            other_slots = set(other_req.get("gpu_slots") or [])
+            other_locks = resolved_locks_dir(other_req)
+            if other_locks is None or other_locks != target_locks:
+                continue
+            other_slots = valid_gpu_slots(other_req.get("gpu_slots"))
             if not (wanted & other_slots):
                 continue
             other_state = read_json(child / "state.json")
@@ -1095,7 +1119,7 @@ def queue_holder_runs(root, job, req):
             if not run_process_alive(other_state):
                 continue
             holders.append(child.name)
-        except (ValueError, KeyError, OSError):
+        except (ValueError, KeyError, TypeError, OSError):
             continue
     return holders
 
@@ -2310,9 +2334,6 @@ def worker(root, job):
             state["worker_identity"] = process_identity(os.getpid())
             write_json(state_path, state)
         shared_paths = {alias: verify_shared_asset(binding) for alias, binding in request["shared"].items()}
-        if gpu_slots:
-            state.update(waiting_for_lock=True)
-            write_json(state_path, state)
         with ExitStack() as stack:
             session_key = request.get("session_key", "")
             if session_key:
@@ -2321,6 +2342,9 @@ def worker(root, job):
                 private_directory(session_dir)
                 session_lock = stack.enter_context(open_lock(session_dir / f"{session_key}.lock"))
                 fcntl.flock(session_lock, fcntl.LOCK_EX)
+            if gpu_slots:
+                state.update(waiting_for_lock=True)
+                write_json(state_path, state)
             for slot in gpu_slots:
                 handle = stack.enter_context(open_lock(locks_dir / f"{slot}.lock"))
                 fcntl.flock(handle, fcntl.LOCK_EX)
@@ -2928,7 +2952,7 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("rr-%Y%m%dT%H%M%S-") + uuid4().hex[:8]
     resume = continuation(host, run_id, getattr(args, "_config_path", None))
-    submitted = False
+    submit_state = "before_submit"
     try:
         with workspace_lease(host, ws_info["workdir"]) as lease:
             rpc = {"lease": lease} if lease is not None else {}
@@ -2984,8 +3008,9 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
                 request["hide_gpu"] = True
             if os.environ.get("REMOTE_RUN_INHERIT_LOGIN_PATH", "1") == "0":
                 request["inherit_login_path"] = False
+            submit_state = "submitting"
             receipt = ssh_call(host, "submit", {"run_id": run_id, "request": request}, **rpc)
-            submitted = True
+            submit_state = "submitted"
             print(f"remote-run: run {run_id} on {host['name']}. {resume}", file=sys.stderr, flush=True)
         if args.follow:
             out = follow_run(host, run_id, raw_log=args.raw_log)
@@ -2997,8 +3022,14 @@ def handle_exec(args, host, repo_root, rel_subdir, proj_cfg):
         else:
             out = receipt
     except KeyboardInterrupt:
-        if submitted:
+        if submit_state == "submitted":
             print(f"\nremote-run: stopped local wait for {run_id}. {resume}", file=sys.stderr)
+        elif submit_state == "submitting":
+            print(
+                f"\nremote-run: interrupted while submitting {run_id} on {host['name']}; "
+                f"remote launch status is unconfirmed. {resume}",
+                file=sys.stderr,
+            )
         else:
             print("\nremote-run: interrupted before job submission completed.", file=sys.stderr)
         raise SystemExit(130)
