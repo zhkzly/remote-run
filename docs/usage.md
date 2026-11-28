@@ -4,7 +4,7 @@ All v2 configuration files require integer `schema_version = 2` and reject unkno
 
 ## 1. Three-Layer Configuration & 4-Level Hierarchy
 
-### Layer 1: Host Catalog (`$XDG_CONFIG_HOME/remote-run/hosts.toml`)
+### Layer 1: Host Catalog (`$XDG_CONFIG_HOME/remote-run/hosts.toml`, or `$REMOTE_RUN_CONFIG`)
 Describes **machines only** (no project bindings or language-specific keys).
 
 | Key | Type | Default | Meaning |
@@ -55,7 +55,7 @@ Managed via `remote-run bind` / `remote-run unbind` (zero modifications to the t
 - **Hard exclusions only**: `.git`, `.ssh`, `.aws`, `.env`, `.env.local`, `.env.*.local`, `.remote-run.toml`, control markers, and any in-repo XDG config/bindings directories.
 - **Single sender manifest**: Git checkouts use `git ls-files` (tracked + non-ignored untracked + initialized submodules) and send exact NUL-delimited paths to `rsync` without `-r` or `--delete`.
 - **Ghost cleanup**: Previously uploaded files/symlinks are removed only when absent locally and still matching their recorded remote snapshot; newly excluded or newly gitignored files still present locally are never deleted remotely.
-- **Type-neutral atomic `pull`**: No `.pt`/`.ckpt` suffix blacklist. Pull filters by recorded `[pull].max_file_mib` and `[pull].exclude`; `--artifact REL` fetches an exact artifact bypassing filters; `--path REL` fetches workspace or registered shared-dir files without `rsync -k` symlink traversal; publication is atomic.
+- **Type-neutral atomic `pull`**: No `.pt`/`.ckpt` suffix blacklist. `[pull].max_file_mib` and `[pull].exclude` filter auto-pulled `artifacts/` only; `--artifact REL` fetches an exact artifact bypassing filters; `--path REL` recursively fetches workspace or registered shared-dir paths (without artifact size/exclude filtering and without `rsync -k` symlink traversal); publication is atomic.
 
 ---
 
@@ -70,9 +70,11 @@ Managed via `remote-run bind` / `remote-run unbind` (zero modifications to the t
 | `remote-run config` | `remote_config` | Inspect merged workspace, PATH layers, env origins, note, GPUs, sync/pull policies |
 | `remote-run doctor --check-cmd ...` | `remote_doctor` | Strictly read-only check of SSH, tools, PATH layers, bare/literal commands, GPUs |
 | `remote-run sync [--dry-run]` | `remote_sync` | Manifest sync with untracked budget guard and ghost cleanup |
-| `remote-run exec [-- CMD \| --shell STR]` | `remote_exec` | Sync (optional) and run `argv` xor `shell` (CPU default; `--gpus` opt-in) |
+| `remote-run exec [-- CMD \| --shell STR]` | `remote_exec` | Sync (optional) and run `argv` xor `shell` (CPU default; `--gpus` opt-in; ad-hoc host runs use `--no-project --no-sync` in CLI or omit `repo` + `no_sync=true` in MCP) |
 | `remote-run status [RUN_ID]` | `remote_status` | List recent runs or inspect status + UTF-8-aligned log slice (pass `--host` from receipt or `--repo`) |
 | `remote-run cancel RUN_ID` | `remote_cancel` | Cancel running/queued job and wait for process group termination (pass `--host` from receipt or `--repo`) |
 | `remote-run pull RUN_ID DEST` | `remote_pull` | Atomically pull logs, eligible artifacts, `--artifact`, or `--path` (pass `--host` from receipt or `--repo`) |
 | `remote-run session list\|reset` | `remote_session` | Inspect or reset opt-in persistent shell sessions |
 | `remote-run prune [--days N] [--apply] [--verbose]` | `remote_prune` | Dry-run or delete old terminal runs with `skipped_unmanaged_count` summary (pass `--host` or `--repo`) |
+
+Run `remote-run --version` to print the installed CLI version (`remote-run <version>`).

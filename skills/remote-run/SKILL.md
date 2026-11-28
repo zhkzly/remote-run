@@ -15,7 +15,7 @@ Use `remote-run` to keep editing and AI collaboration on the laptop while execut
    - **Important**: If `environment.note` or `path_layers` shows a prebuilt toolchain/environment on the remote host, invoke its executables directly (e.g. `["python", "-u", ...]`, `["cargo", "test"]`, `["pytest", "-q"]`) instead of running package-manager wrappers that download duplicate multi-GB environments into the remote workspace.
 2. **Verify readiness if needed** (`remote_doctor` / `remote-run doctor --repo <abs_path> --check-cmd ...`):
    - Strictly read-only. Supports both bare executable names (`cargo`, `node`, `python`) and literal paths (`/opt/envs/proj/bin/python`, `scripts/run.sh`).
-   - For framework-specific probes (e.g. `torch.cuda.is_available()` or `nvcc --version`), run an explicit `remote_exec` with `no_sync: true`.
+   - For framework-specific probes (e.g. `torch.cuda.is_available()` or `nvcc --version`), run an explicit `remote_exec` with `no_sync: true` (pass `repo` only if already synced, or omit `repo` for host-only probes).
 3. **Execute remotely** (`remote_exec` / `remote-run exec`):
    - Provide **exactly one** of `argv` (array of strings, e.g. `["cargo", "test"]`) OR `shell` (explicit bash string, e.g. `"cmake --build build && ctest"`). Never pass both, and never pass a boolean for `shell`.
    - For ad-hoc host commands without a local project: in CLI pass `--no-project --no-sync`; in MCP `remote_exec` simply **omit `repo`** and pass `no_sync: true` (MCP has no `no_project` parameter). Omit `remote_dir` to run in `<root>/adhoc` and pass absolute paths to your command; to inspect a synced workspace subpath, pass `repo` + `no_sync: true`.

@@ -93,6 +93,7 @@ v2 uses a separate default remote root (`~/.local/share/remote-run-v2`) so in-fl
 | `hosts.<h>.envs.<name>` (`python`, `path_prepend`, `env`) | `remote-run bind --scope repo --host <h> --path ... --env ... --note ...` |
 | `hosts.<h>.shared.<name>` + `.remote-run.toml [share].host` | Ordinary `--env KEY=/remote/path` in repo binding (or `hosts.<h>.env` if truly machine-wide) |
 | `.remote-run.toml` `host` / `env` / `workspace` | `remote-run bind --scope repo` (host/env/path/gpus) and `--scope checkout --workspace ...` |
+| `.remote-run.toml [env_vars]` | `.remote-run.toml [env]` (machine-agnostic) or `remote-run bind --scope repo --env KEY=VAL` (host-specific) |
 | `.remote-run.toml [share].project` | `.remote-run.toml [workspace].shared` |
 | `.remote-run.toml [sync].ignore` | `.remote-run.toml [sync].exclude` (plus `max_untracked_mib`) |
 | `exec --device cuda:0,1` / `--env ...` | `exec --gpus 0,1` / `--path` / `--env KEY=VAL` |

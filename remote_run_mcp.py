@@ -137,7 +137,7 @@ TOOLS = [
                 "repo": {"type": "string", "description": "Absolute path to local project dir (required for project runs; omit with no_sync=true for ad-hoc host runs)"},
                 "host": {"type": "string", "description": "Optional host alias override"},
                 "workspace": {"type": "string", "description": "Optional workspace ID override"},
-                "remote_dir": {"type": "string", "description": "Existing remote dir (only for ad-hoc runs without repo + no_sync=true)"},
+                "remote_dir": {"type": "string", "description": "Existing remote dir (only for ad-hoc runs without repo + no_sync=true; omit to run in <root>/adhoc)"},
                 "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Executable + arguments array (mutually exclusive with shell)"},
                 "shell": {"type": "string", "minLength": 1, "description": "Explicit bash command string (mutually exclusive with argv)"},
                 "no_sync": {"type": "boolean", "description": "Skip manifest upload before executing"},

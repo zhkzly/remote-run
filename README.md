@@ -132,7 +132,7 @@ remote-run exec --follow -- cargo test
 remote-run exec --follow -- go test ./...
 remote-run exec --follow -- node --test
 remote-run exec --follow -- cmake --build build
-remote-run exec --gpus 0,1 --wait 15 -- python -u train.py
+remote-run exec --host gpu-workstation --gpus 0,1 --wait 15 -- python -u train.py  # on a GPU-configured host
 remote-run exec --no-gpu -- pytest -q
 remote-run pull <run_id> ./pulled-run --path build/summary.json
 ```

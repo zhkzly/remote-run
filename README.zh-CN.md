@@ -41,10 +41,10 @@ ln -sf ~/remote-run/bin/remote-run ~/.local/bin/remote-run
 ln -sf ~/remote-run/bin/remote-run-mcp ~/.local/bin/remote-run-mcp
 
 # 2. 探测并注册远端机器（或手写 3 行 hosts.toml）
-remote-run init linux-builder --default
+remote-run init linux-builder --name builder --default
 
 # 3. 可选：为仓库绑定默认主机、远端预装 PATH 与数据目录（所有 worktree 自动继承；有 [gpu] 的主机可加 --gpus 0）
-remote-run bind --scope repo --host linux-builder \
+remote-run bind --scope repo --host builder \
   --note "Prebuilt env ready; invoke python/pytest directly" \
   --path /opt/envs/proj/bin \
   --env DATASET_DIR=/srv/datasets/v2
