@@ -45,6 +45,8 @@ class CliMcpAndE2ETests(unittest.TestCase):
             env = {**os.environ, "XDG_CONFIG_HOME": str(xdg), "REMOTE_RUN_SSH_CONTROL": "0"}
             cli_link = t / "remote-run-link"
             cli_link.symlink_to(ROOT / "bin" / "remote-run")
+            ver = subprocess.run([str(cli_link), "--version"], env=env, capture_output=True, text=True, check=True)
+            self.assertIn("2.0.0", ver.stdout)
             res = subprocess.run([str(cli_link), "hosts"], env=env, capture_output=True, text=True, check=True)
             data = json.loads(res.stdout)
             self.assertEqual(data["default_host"], "b")

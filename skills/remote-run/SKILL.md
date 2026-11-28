@@ -18,6 +18,7 @@ Use `remote-run` to keep editing and AI collaboration on the laptop while execut
    - For framework-specific probes (e.g. `torch.cuda.is_available()` or `nvcc --version`), run an explicit `remote_exec` with `no_sync: true`.
 3. **Execute remotely** (`remote_exec` / `remote-run exec`):
    - Provide **exactly one** of `argv` (array of strings, e.g. `["cargo", "test"]`) OR `shell` (explicit bash string, e.g. `"cmake --build build && ctest"`). Never pass both, and never pass a boolean for `shell`.
+   - For ad-hoc host commands without a local project: in CLI pass `--no-project --no-sync`; in MCP `remote_exec` simply **omit `repo`** and pass `no_sync: true` (MCP has no `no_project` parameter).
    - Prefer `argv` for simple commands; use `shell` only for pipes, redirections, `&&`, or `cd` in a persistent `session`.
    - On GPU hosts, CPU execution is the default unless `gpus` is bound or passed explicitly (`gpus: [0]` / `--gpus 0`). Use `no_gpu: true` (`--no-gpu`) to override a GPU binding for lightweight CPU tests.
    - Use `wait` (default `15`s). Long jobs detach cleanly in remote `tmux` and return `detached: true` with `run_id`, `host`, and `next_action`.

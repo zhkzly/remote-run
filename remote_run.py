@@ -12,6 +12,7 @@ import sys
 import tomllib
 
 from remote_worker import DEFAULT_REMOTE_ROOT, identifier
+from remote_run_local import __version__
 from remote_run_local.config import default_hosts_config_path
 from remote_run_local import service as svc
 
@@ -76,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser = argparse.ArgumentParser(prog="remote-run", description=__doc__, parents=[common])
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="action", required=True)
 
     sub.add_parser("hosts", parents=[common], help="List configured remote hosts")
