@@ -608,7 +608,10 @@ def validate_remote_workdir(root: Path, wdir: Path) -> Path:
             f"Refusing unsafe remote workdir {w} (cannot be '/', remote $HOME, or an ancestor of $HOME)"
         )
     if w == r or r.is_relative_to(w):
-        raise ValueError(f"Refusing remote workdir {w}: cannot equal or contain remote root {r}")
+        raise ValueError(
+            f"Refusing remote workdir {w}: cannot equal or contain remote root {r}. "
+            "For ad-hoc host probes, omit remote_dir (runs in <root>/adhoc) and pass absolute paths to your command."
+        )
     for reserved in ("runs", "locks", "sessions", "workspace-locks", "retired-runs", "pull-stages"):
         if w.is_relative_to(r / reserved) or w.is_relative_to((r / reserved).resolve()):
             raise ValueError(f"Refusing remote workdir {w}: inside reserved control dir {r / reserved}")
@@ -619,7 +622,8 @@ def validate_remote_workdir(root: Path, wdir: Path) -> Path:
             raise ValueError(f"Refusing remote workdir {w}: inside project shared dir")
         if len(rel_parts) != 3 or rel_parts[1] != "workspaces":
             raise ValueError(
-                f"Refusing remote workdir {w}: paths under projects/ must be projects/<project>/workspaces/<workspace>"
+                f"Refusing remote workdir {w}: paths under projects/ must be projects/<project>/workspaces/<workspace>. "
+                "To inspect a synced workspace subpath, pass repo with no_sync=true instead of remote_dir."
             )
     return w
 

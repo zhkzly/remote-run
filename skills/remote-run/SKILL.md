@@ -18,16 +18,15 @@ Use `remote-run` to keep editing and AI collaboration on the laptop while execut
    - For framework-specific probes (e.g. `torch.cuda.is_available()` or `nvcc --version`), run an explicit `remote_exec` with `no_sync: true`.
 3. **Execute remotely** (`remote_exec` / `remote-run exec`):
    - Provide **exactly one** of `argv` (array of strings, e.g. `["cargo", "test"]`) OR `shell` (explicit bash string, e.g. `"cmake --build build && ctest"`). Never pass both, and never pass a boolean for `shell`.
-   - For ad-hoc host commands without a local project: in CLI pass `--no-project --no-sync`; in MCP `remote_exec` simply **omit `repo`** and pass `no_sync: true` (MCP has no `no_project` parameter).
+   - For ad-hoc host commands without a local project: in CLI pass `--no-project --no-sync`; in MCP `remote_exec` simply **omit `repo`** and pass `no_sync: true` (MCP has no `no_project` parameter). Omit `remote_dir` to run in `<root>/adhoc` and pass absolute paths to your command; to inspect a synced workspace subpath, pass `repo` + `no_sync: true`.
    - Prefer `argv` for simple commands; use `shell` only for pipes, redirections, `&&`, or `cd` in a persistent `session`.
    - On GPU hosts, CPU execution is the default unless `gpus` is bound or passed explicitly (`gpus: [0]` / `--gpus 0`). Use `no_gpu: true` (`--no-gpu`) to override a GPU binding for lightweight CPU tests.
    - Use `wait` (default `15`s). Long jobs detach cleanly in remote `tmux` and return `detached: true` with `run_id`, `host`, and `next_action`.
    - If `status == "queued"` and `waiting_for_lock == true`, check `blocked_by_runs` and wait rather than re-submitting duplicate jobs.
 4. **Monitor & pull** (`remote_status`, `remote_cancel`, `remote_pull`):
    - Always pass the `host` from the submission receipt to `remote_status`, `remote_cancel`, and `remote_pull`.
-   - For MCP `remote_status`, keep `wait` short (e.g. `30–90`s) to stay within MCP client call timeouts; for CLI, avoid piping `remote-run exec ... | tail` (it truncates the JSON header and `run_id`) — use `--tail-bytes` instead.
-   - Use `offset` (from previous `log.next_offset`) to paginate logs cleanly without splitting UTF-8 characters.
-   - Pull writes atomically into a new destination directory (`--artifact REL` bypasses size/exclude filters for a specific artifact; `--path REL` lands under `<destination>/workspace/<REL>`, reported in `workdir_destination`). Write small summaries/index files to `$REMOTE_RUN_ARTIFACTS` to pull everything in one shot without duplicating `--path`.
+   - For MCP `remote_status`, use backoff between polls and pass `offset` (from previous `log.next_offset`) rather than repeatedly polling `wait=0` with no offset; keep `wait` short (e.g. `30–90`s) over MCP to stay within client call timeouts. For CLI, avoid piping `remote-run exec ... | tail` (it truncates JSON/`run_id`) — use `--tail-bytes`.
+   - Pull writes atomically into a new destination directory (`--artifact REL` bypasses size/exclude filters for a specific artifact; `--path REL` lands under `<destination>/workspace/<REL>`, reported in `workdir_destination`). Write small summaries/index files to `$REMOTE_RUN_ARTIFACTS` so one `remote_pull` fetches them cleanly; for large multi-hundred-MiB directories, prefer CLI `remote-run pull` (not MCP `remote_pull`) to avoid MCP client 180s tool timeouts.
    - Note: after upgrading `remote-run`, restart long-lived MCP client sessions so the updated `remote-run-mcp` schema is loaded.
 
 ## Configuration & Setup

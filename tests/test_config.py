@@ -50,8 +50,15 @@ class ConfigAndBindingsTests(unittest.TestCase):
 
     def test_v1_rejected_and_minimal_cpu_host_accepted(self):
         self.hosts_file.write_text('schema_version = 1\n[hosts.box]\nssh = "box"\n')
-        with self.assertRaisesRegex(ValueError, "schema_version must be integer 2"):
+        with self.assertRaisesRegex(ValueError, "schema_version must be integer 2.*Migrate"):
             cfg.load_hosts_config(self.hosts_file)
+
+        # Legacy v1 .remote-run.toml with v1-only keys MUST report schema_version v1 migration hint FIRST (not Unknown keys).
+        v1_repo = self.tmp / "v1-proj"
+        v1_repo.mkdir()
+        (v1_repo / ".remote-run.toml").write_text('schema_version = 1\nhost = "box"\n[share]\nhost = ["d=x"]\n')
+        with self.assertRaisesRegex(ValueError, "schema_version must be integer 2.*remote-run bind"):
+            cfg.load_project_config(v1_repo)
 
         # Minimal 3-line CPU host with only ssh configured.
         self.hosts_file.write_text('schema_version = 2\n[hosts.cpu-box]\nssh = "user@cpu-box"\n')

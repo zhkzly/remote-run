@@ -95,9 +95,15 @@ def check_schema_version(mapping: dict, label: str) -> None:
         raise ValueError(f"{label} requires integer schema_version = {SCHEMA_VERSION}")
     version = mapping["schema_version"]
     if type(version) is not int or version != SCHEMA_VERSION:
+        hint = (
+            " Migrate to schema_version = 2 (move host/env/gpu settings to `remote-run bind --scope repo`) "
+            "or remove legacy .remote-run.toml."
+            if version == 1
+            else ""
+        )
         raise ValueError(
             f"{label} schema_version must be integer {SCHEMA_VERSION} (got {version!r}; "
-            f"v1 configs are not supported in remote-run v2)"
+            f"v1 configs are not supported in remote-run v2).{hint}"
         )
 
 
@@ -168,8 +174,8 @@ def load_hosts_config(path: Path) -> tuple[str | None, dict[str, dict]]:
         raise ValueError(f"Host config not found: {path}. Run `remote-run init <ssh-target>` or create {path}")
     with path.open("rb") as f:
         cfg = tomllib.load(f)
-    check_keys(cfg, HOST_TOP_KEYS, str(path))
     check_schema_version(cfg, str(path))
+    check_keys(cfg, HOST_TOP_KEYS, str(path))
     hosts = cfg.get("hosts")
     if not isinstance(hosts, dict) or not hosts:
         raise ValueError(f"{path} must define at least one [hosts.<name>] entry")
@@ -313,8 +319,8 @@ def load_project_config(repo_root: Path) -> dict:
     with cfg_path.open("rb") as f:
         raw = tomllib.load(f)
     label = str(cfg_path)
-    check_keys(raw, PROJECT_TOP_KEYS, label)
     check_schema_version(raw, label)
+    check_keys(raw, PROJECT_TOP_KEYS, label)
 
     raw_path = raw.get("path", [])
     if not isinstance(raw_path, list):
@@ -444,8 +450,8 @@ def load_binding(scope: str, key: str) -> dict:
         raw = tomllib.load(f)
     label = str(path)
     allowed = REPO_BINDING_KEYS if scope == "repo" else CHECKOUT_BINDING_KEYS
-    check_keys(raw, allowed, label)
     check_schema_version(raw, label)
+    check_keys(raw, allowed, label)
 
     host = identifier(raw["host"], f"{label} host") if "host" in raw else ""
     host_ep = raw.get("host_endpoint", "")
